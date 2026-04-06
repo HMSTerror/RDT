@@ -1,0 +1,21 @@
+{
+  "dataset_name": "amazon_music",
+  "history_len": 50,
+  "chunk_size": 100,
+  "k_core": 5,
+  "num_users": 27403,
+  "num_items": 10449,
+  "num_sequences": 27403,
+  "total_samples_before_chunk_drop": 202955,
+  "total_samples_written": 200,
+  "dropped_tail_samples": 202755,
+  "num_chunks_written": 2,
+  "embedding_path": "data\\Amazon_Music_And_Instruments\\item_embeddings.npy",
+  "reviews_path": "data\\Amazon_Music_And_Instruments\\Musical_Instruments_5.json",
+  "meta_path": "data\\Amazon_Music_And_Instruments\\meta_Musical_Instruments.json",
+  "image_root": "data\\images",
+  "stats_only": false,
+  "max_samples": 200,
+  "storage_mode": "lightweight_chunk_index",
+  "prefetch_images": false
+}
