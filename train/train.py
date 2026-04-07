@@ -188,10 +188,25 @@ def train(args, logger):
         tokenizer = DummyTokenizer(vocab_size=512)
         text_encoder = DummyTextEncoder(vocab_size=512, hidden_size=48)
     else:
+        text_use_offload_folder = os.environ.get("RDT_T5_OFFLOAD_DIR")
+        text_allow_device_map = False
+        if accelerator.num_processes > 1:
+            if text_use_offload_folder:
+                logger.warning(
+                    "Ignoring `RDT_T5_OFFLOAD_DIR` because distributed training requires "
+                    "loading the frozen T5 encoder without `device_map`."
+                )
+            text_use_offload_folder = None
+        elif text_use_offload_folder:
+            text_allow_device_map = True
+
         text_embedder = T5Embedder(
             from_pretrained=args.pretrained_text_encoder_name_or_path,
             model_max_length=config["dataset"]["tokenizer_max_length"],
             device=accelerator.device,
+            torch_dtype=weight_dtype,
+            use_offload_folder=text_use_offload_folder,
+            allow_device_map=text_allow_device_map,
         )
         tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 

@@ -8,6 +8,8 @@ cd "$ROOT_DIR"
 : "${REVIEWS_URL:=https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Musical_Instruments_5.json.gz}"
 : "${META_URL:=https://jmcauley.ucsd.edu/pml_data/meta_Musical_Instruments.json.gz}"
 : "${FORCE_DOWNLOAD:=0}"
+: "${INSECURE_SKIP_TLS_VERIFY:=0}"
+: "${CA_BUNDLE:=}"
 
 mkdir -p "${DATA_ROOT}"
 
@@ -16,12 +18,28 @@ download_file() {
   local output="$2"
 
   if command -v curl >/dev/null 2>&1; then
-    curl -L --fail --retry 3 --retry-delay 2 -o "${output}" "${url}"
+    local curl_args=(-L --fail --retry 3 --retry-delay 2 -o "${output}")
+    if [[ -n "${CA_BUNDLE}" ]]; then
+      curl_args+=(--cacert "${CA_BUNDLE}")
+    fi
+    if [[ "${INSECURE_SKIP_TLS_VERIFY}" == "1" ]]; then
+      echo "[warn] TLS certificate verification is disabled for curl."
+      curl_args+=(-k)
+    fi
+    curl "${curl_args[@]}" "${url}"
     return
   fi
 
   if command -v wget >/dev/null 2>&1; then
-    wget -O "${output}" "${url}"
+    local wget_args=(-O "${output}")
+    if [[ -n "${CA_BUNDLE}" ]]; then
+      wget_args+=(--ca-certificate="${CA_BUNDLE}")
+    fi
+    if [[ "${INSECURE_SKIP_TLS_VERIFY}" == "1" ]]; then
+      echo "[warn] TLS certificate verification is disabled for wget."
+      wget_args+=(--no-check-certificate)
+    fi
+    wget "${wget_args[@]}" "${url}"
     return
   fi
 
@@ -80,4 +98,8 @@ Optional next step:
 Notes:
   - item_embeddings.npy is not downloaded by this script.
   - preprocess_amazon.py will generate dummy 128-d item embeddings if that file is absent.
+  - If your server lacks CA certificates, you can temporarily use:
+      INSECURE_SKIP_TLS_VERIFY=1 bash scripts/download_amazon_music_dataset.sh
+  - A safer option is:
+      CA_BUNDLE=/path/to/cacert.pem bash scripts/download_amazon_music_dataset.sh
 EOF

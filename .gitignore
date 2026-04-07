@@ -175,6 +175,7 @@ checkpoints/
 
 # Local datasets
 data/Amazon_Music_And_Instruments/
+data/images/
 
 # VSC
 .vscode/

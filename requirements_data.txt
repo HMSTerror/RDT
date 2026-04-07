@@ -1,4 +1,4 @@
 # Preprocessing-only dependencies for the RecSys Amazon pipeline.
-numpy>=1.26,<3
+numpy>=1.26,<2
 pillow==10.2.0
 tqdm==4.66.4
