@@ -8,11 +8,17 @@ cd "$ROOT_DIR"
 : "${VISION_ENCODER_PATH:?Set VISION_ENCODER_PATH to your local SigLIP checkpoint path}"
 : "${BUFFER_ROOT:=/data/amazon_music_buffer}"
 : "${IMAGE_ROOT:=/data/images}"
+: "${SAMPLE_BUFFER_ROOT:=}"
 : "${OUTPUT_DIR:=checkpoints/recsys_amazon}"
 : "${NUM_PROCESSES:=8}"
 : "${MIXED_PRECISION:=bf16}"
 
 export TOKENIZERS_PARALLELISM=false
+
+extra_args=()
+if [[ -n "${SAMPLE_BUFFER_ROOT}" ]]; then
+  extra_args+=(--sample_buffer_root "${SAMPLE_BUFFER_ROOT}")
+fi
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
@@ -32,4 +38,5 @@ accelerate launch \
   --num_sample_batches 2 \
   --sample_topk 5,10,20 \
   --sample_exclude_history_items \
+  "${extra_args[@]}" \
   "$@"

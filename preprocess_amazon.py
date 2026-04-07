@@ -65,6 +65,7 @@ EMBED_DIM = 128
 IMAGE_SIZE = 224
 DATASET_NAME = "amazon_music"
 IMAGE_CACHE_SIZE = 256
+SPLIT_NAMES = ("train", "val", "test")
 
 try:
     RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
@@ -164,6 +165,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed used only for dummy item embeddings.",
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="leave_last_two",
+        choices=["none", "leave_last_two"],
+        help=(
+            "How to split user sequences into buffers. "
+            "`leave_last_two` writes self-contained train/val/test buffers where "
+            "each user's last target is test, the previous target is val, and all "
+            "earlier targets are train. Use `none` to keep the legacy single-buffer layout."
+        ),
     )
     return parser.parse_args()
 
@@ -571,6 +584,100 @@ def save_global_item_store(
     safe_write_json(output_root / "item_meta.json", item_meta)
 
 
+def get_target_split(sequence_len: int, target_pos: int, split_mode: str) -> str:
+    if split_mode == "none":
+        return "train"
+    if sequence_len < 2:
+        raise ValueError(f"Expected sequence_len >= 2, but got {sequence_len}.")
+    if target_pos == sequence_len - 1:
+        return "test"
+    if target_pos == sequence_len - 2:
+        return "val"
+    return "train"
+
+
+def count_sequence_samples_by_split(sequence_len: int, split_mode: str) -> Dict[str, int]:
+    total = max(sequence_len - 1, 0)
+    if split_mode == "none":
+        return {"train": total}
+    return {
+        "train": max(sequence_len - 3, 0),
+        "val": 1 if sequence_len >= 3 else 0,
+        "test": 1 if sequence_len >= 2 else 0,
+    }
+
+
+def aggregate_split_counts(
+    sequences: Dict[int, List[str]],
+    split_mode: str,
+) -> Dict[str, int]:
+    split_names = ["train"] if split_mode == "none" else list(SPLIT_NAMES)
+    counts = {split: 0 for split in split_names}
+    for sequence in sequences.values():
+        for split_name, count in count_sequence_samples_by_split(len(sequence), split_mode).items():
+            counts[split_name] += count
+    return counts
+
+
+def build_split_write_plan(
+    raw_count: int,
+    *,
+    chunk_size: int,
+    max_samples: int,
+) -> Dict[str, int]:
+    samples_to_write = raw_count
+    if max_samples > 0:
+        samples_to_write = min(samples_to_write, max_samples)
+    full_chunks = samples_to_write // chunk_size
+    samples_to_write = full_chunks * chunk_size
+    dropped_tail = raw_count - samples_to_write
+    return {
+        "raw_count": raw_count,
+        "samples_to_write": samples_to_write,
+        "full_chunks": full_chunks,
+        "dropped_tail": dropped_tail,
+    }
+
+
+def build_stats_payload(
+    *,
+    args: argparse.Namespace,
+    user_map: Dict[str, int],
+    item_map: Dict[str, int],
+    sequences: Dict[int, List[str]],
+    samples_to_write: int,
+    dropped_tail: int,
+    num_chunks_written: int,
+    total_samples_before_chunk_drop: int,
+    split_name: Optional[str] = None,
+) -> Dict[str, object]:
+    payload = {
+        "dataset_name": DATASET_NAME,
+        "history_len": args.history_len,
+        "chunk_size": args.chunk_size,
+        "k_core": K_CORE,
+        "num_users": len(user_map),
+        "num_items": len(item_map),
+        "num_sequences": len(sequences),
+        "total_samples_before_chunk_drop": total_samples_before_chunk_drop,
+        "total_samples_written": samples_to_write,
+        "dropped_tail_samples": dropped_tail,
+        "num_chunks_written": num_chunks_written,
+        "embedding_path": str(args.embedding_path),
+        "reviews_path": str(args.reviews_path),
+        "meta_path": str(args.meta_path),
+        "image_root": str(args.image_root),
+        "stats_only": bool(args.stats_only),
+        "max_samples": int(args.max_samples),
+        "storage_mode": "lightweight_chunk_index",
+        "prefetch_images": bool(args.prefetch_images),
+        "split_mode": args.split_mode,
+    }
+    if split_name is not None:
+        payload["split_name"] = split_name
+    return payload
+
+
 def flush_chunk_samples(
     chunk_dir: Path,
     chunk_samples: List[Dict[str, np.ndarray]],
@@ -637,52 +744,89 @@ def main() -> None:
     del filtered
     gc.collect()
 
-    total_samples = sum(max(len(sequence) - 1, 0) for sequence in sequences.values())
-    full_chunks = total_samples // args.chunk_size
-    samples_to_write = full_chunks * args.chunk_size
-    if args.max_samples > 0:
-        capped = min(samples_to_write, args.max_samples)
-        samples_to_write = (capped // args.chunk_size) * args.chunk_size
-        full_chunks = samples_to_write // args.chunk_size
-    dropped_tail = total_samples - samples_to_write
-    if samples_to_write == 0:
+    split_names = ["train"] if args.split_mode == "none" else list(SPLIT_NAMES)
+    split_raw_counts = aggregate_split_counts(sequences, args.split_mode)
+    split_write_plans = {
+        split_name: build_split_write_plan(
+            split_raw_counts[split_name],
+            chunk_size=args.chunk_size,
+            max_samples=args.max_samples,
+        )
+        for split_name in split_names
+    }
+
+    total_samples = sum(plan["raw_count"] for plan in split_write_plans.values())
+    total_samples_to_write = sum(plan["samples_to_write"] for plan in split_write_plans.values())
+    total_dropped_tail = sum(plan["dropped_tail"] for plan in split_write_plans.values())
+
+    if total_samples_to_write == 0:
         raise RuntimeError(
-            "Not enough samples to form a full chunk. "
-            f"Need at least {args.chunk_size} samples, but only found {total_samples}."
+            "Not enough samples to form a full chunk under the current split settings. "
+            f"Need at least {args.chunk_size} samples in at least one split."
         )
 
     light_sample_bytes = estimate_light_sample_bytes(args.history_len)
-    approx_gib = (samples_to_write * light_sample_bytes) / (1024 ** 3)
-    print(f"[samples] total={total_samples} write={samples_to_write} drop_tail={dropped_tail}")
-    print(f"[chunks]  full_chunks={full_chunks}")
+    approx_gib = (total_samples_to_write * light_sample_bytes) / (1024 ** 3)
+    print(
+        f"[samples] total={total_samples} write={total_samples_to_write} "
+        f"drop_tail={total_dropped_tail} split_mode={args.split_mode}"
+    )
+    for split_name in split_names:
+        plan = split_write_plans[split_name]
+        print(
+            f"[split:{split_name}] total={plan['raw_count']} "
+            f"write={plan['samples_to_write']} "
+            f"drop_tail={plan['dropped_tail']} "
+            f"chunks={plan['full_chunks']}"
+        )
     print(f"[disk]    approx lightweight index payload={approx_gib:.4f} GiB")
 
-    stats = {
-        "dataset_name": DATASET_NAME,
-        "history_len": args.history_len,
-        "chunk_size": args.chunk_size,
-        "k_core": K_CORE,
-        "num_users": len(user_map),
-        "num_items": len(item_map),
-        "num_sequences": len(sequences),
-        "total_samples_before_chunk_drop": total_samples,
-        "total_samples_written": samples_to_write,
-        "dropped_tail_samples": dropped_tail,
-        "num_chunks_written": full_chunks,
-        "embedding_path": str(args.embedding_path),
-        "reviews_path": str(args.reviews_path),
-        "meta_path": str(args.meta_path),
-        "image_root": str(args.image_root),
-        "stats_only": bool(args.stats_only),
-        "max_samples": int(args.max_samples),
-        "storage_mode": "lightweight_chunk_index",
-        "prefetch_images": bool(args.prefetch_images),
-    }
-
-    if args.stats_only:
-        print("========== Stats Only ==========")
-        print(json.dumps(stats, indent=2, ensure_ascii=False))
-        return
+    if args.split_mode == "none":
+        stats = build_stats_payload(
+            args=args,
+            user_map=user_map,
+            item_map=item_map,
+            sequences=sequences,
+            samples_to_write=split_write_plans["train"]["samples_to_write"],
+            dropped_tail=split_write_plans["train"]["dropped_tail"],
+            num_chunks_written=split_write_plans["train"]["full_chunks"],
+            total_samples_before_chunk_drop=split_write_plans["train"]["raw_count"],
+            split_name="train",
+        )
+        if args.stats_only:
+            print("========== Stats Only ==========")
+            print(json.dumps(stats, indent=2, ensure_ascii=False))
+            return
+    else:
+        split_manifest = {
+            "dataset_name": DATASET_NAME,
+            "split_mode": args.split_mode,
+            "history_len": args.history_len,
+            "chunk_size": args.chunk_size,
+            "k_core": K_CORE,
+            "num_users": len(user_map),
+            "num_items": len(item_map),
+            "num_sequences": len(sequences),
+            "embedding_path": str(args.embedding_path),
+            "reviews_path": str(args.reviews_path),
+            "meta_path": str(args.meta_path),
+            "image_root": str(args.image_root),
+            "max_samples": int(args.max_samples),
+            "storage_mode": "lightweight_chunk_index",
+            "splits": {
+                split_name: {
+                    "total_samples_before_chunk_drop": split_write_plans[split_name]["raw_count"],
+                    "total_samples_written": split_write_plans[split_name]["samples_to_write"],
+                    "dropped_tail_samples": split_write_plans[split_name]["dropped_tail"],
+                    "num_chunks_written": split_write_plans[split_name]["full_chunks"],
+                }
+                for split_name in split_names
+            },
+        }
+        if args.stats_only:
+            print("========== Stats Only ==========")
+            print(json.dumps(split_manifest, indent=2, ensure_ascii=False))
+            return
 
     item_embeddings = load_item_embeddings(item_map, args.embedding_path, seed=args.seed)
     meta_dict = load_item_meta(args.meta_path, list(item_map.keys()))
@@ -700,19 +844,36 @@ def main() -> None:
         IMAGE_STORE.prefetch_missing_images(list(item_map.keys()), num_workers=args.download_workers)
 
     prepare_output_dir(args.output_root, overwrite=args.overwrite)
-    save_mapping_files(args.output_root, user_map, item_map)
-    save_global_item_store(args.output_root, item_embeddings, meta_dict)
+    split_roots = {
+        split_name: (args.output_root if args.split_mode == "none" else args.output_root / split_name)
+        for split_name in split_names
+    }
+    for split_name, split_root in split_roots.items():
+        split_root.mkdir(parents=True, exist_ok=True)
+        save_mapping_files(split_root, user_map, item_map)
+        save_global_item_store(split_root, item_embeddings, meta_dict)
 
-    written = 0
-    write_bar = tqdm(total=samples_to_write, desc="Writing chunk samples", unit="sample")
-    current_chunk_samples: List[Dict[str, np.ndarray]] = []
-    chunk_idx = 0
+    if args.split_mode != "none":
+        safe_write_json(args.output_root / "split_manifest.json", split_manifest)
+
+    written_by_split = {split_name: 0 for split_name in split_names}
+    current_chunk_samples: Dict[str, List[Dict[str, np.ndarray]]] = {
+        split_name: [] for split_name in split_names
+    }
+    chunk_idx_by_split = {split_name: 0 for split_name in split_names}
+    write_bar = tqdm(
+        total=total_samples_to_write,
+        desc="Writing chunk samples",
+        unit="sample",
+    )
 
     for remapped_user_id in sorted(sequences.keys()):
         sequence = sequences[remapped_user_id]
         for target_pos in range(1, len(sequence)):
-            if written >= samples_to_write:
-                break
+            split_name = get_target_split(len(sequence), target_pos, args.split_mode)
+            split_plan = split_write_plans[split_name]
+            if written_by_split[split_name] >= split_plan["samples_to_write"]:
+                continue
 
             sample_record = build_lightweight_sample(
                 user_id=remapped_user_id,
@@ -721,24 +882,26 @@ def main() -> None:
                 item_map=item_map,
                 history_len=args.history_len,
             )
-            current_chunk_samples.append(sample_record)
-
-            written += 1
+            current_chunk_samples[split_name].append(sample_record)
+            written_by_split[split_name] += 1
             write_bar.update(1)
 
-            if len(current_chunk_samples) == args.chunk_size:
-                chunk_dir = args.output_root / f"chunk_{chunk_idx}"
+            if len(current_chunk_samples[split_name]) == args.chunk_size:
+                chunk_dir = split_roots[split_name] / f"chunk_{chunk_idx_by_split[split_name]}"
                 chunk_dir.mkdir(parents=True, exist_ok=False)
                 flush_chunk_samples(
                     chunk_dir=chunk_dir,
-                    chunk_samples=current_chunk_samples,
+                    chunk_samples=current_chunk_samples[split_name],
                     chunk_size=args.chunk_size,
                     history_len=args.history_len,
                 )
-                current_chunk_samples = []
-                chunk_idx += 1
+                current_chunk_samples[split_name] = []
+                chunk_idx_by_split[split_name] += 1
 
-        if written >= samples_to_write:
+        if all(
+            written_by_split[name] >= split_write_plans[name]["samples_to_write"]
+            for name in split_names
+        ):
             break
 
         if (remapped_user_id + 1) % 100 == 0:
@@ -746,17 +909,60 @@ def main() -> None:
 
     write_bar.close()
 
-    if current_chunk_samples:
-        raise RuntimeError(
-            "Encountered a partially filled chunk at the end of writing. "
-            "This should not happen after dropping tail samples."
-        )
+    for split_name in split_names:
+        if current_chunk_samples[split_name]:
+            raise RuntimeError(
+                "Encountered a partially filled chunk at the end of writing. "
+                f"This should not happen after dropping tail samples for split `{split_name}`."
+            )
 
-    stats["total_samples_written"] = written
-    safe_write_json(args.output_root / "stats.json", stats)
+        split_stats = build_stats_payload(
+            args=args,
+            user_map=user_map,
+            item_map=item_map,
+            sequences=sequences,
+            samples_to_write=written_by_split[split_name],
+            dropped_tail=split_write_plans[split_name]["dropped_tail"],
+            num_chunks_written=chunk_idx_by_split[split_name],
+            total_samples_before_chunk_drop=split_write_plans[split_name]["raw_count"],
+            split_name=split_name,
+        )
+        safe_write_json(split_roots[split_name] / "stats.json", split_stats)
 
     print("========== Done ==========")
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    if args.split_mode == "none":
+        final_payload = build_stats_payload(
+            args=args,
+            user_map=user_map,
+            item_map=item_map,
+            sequences=sequences,
+            samples_to_write=written_by_split["train"],
+            dropped_tail=split_write_plans["train"]["dropped_tail"],
+            num_chunks_written=chunk_idx_by_split["train"],
+            total_samples_before_chunk_drop=split_write_plans["train"]["raw_count"],
+            split_name="train",
+        )
+    else:
+        final_payload = {
+            "dataset_name": DATASET_NAME,
+            "split_mode": args.split_mode,
+            "output_root": str(args.output_root),
+            "splits": {
+                split_name: build_stats_payload(
+                    args=args,
+                    user_map=user_map,
+                    item_map=item_map,
+                    sequences=sequences,
+                    samples_to_write=written_by_split[split_name],
+                    dropped_tail=split_write_plans[split_name]["dropped_tail"],
+                    num_chunks_written=chunk_idx_by_split[split_name],
+                    total_samples_before_chunk_drop=split_write_plans[split_name]["raw_count"],
+                    split_name=split_name,
+                )
+                for split_name in split_names
+            },
+        }
+    print(json.dumps(final_payload, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

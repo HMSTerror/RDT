@@ -4,7 +4,6 @@
 import argparse
 import copy
 import json
-import os
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +51,16 @@ def parse_args():
         type=str,
         default=None,
         help="Optional runtime override for dataset.image_root in the YAML config.",
+    )
+    parser.add_argument(
+        "--buffer_split",
+        type=str,
+        default="test",
+        choices=["none", "train", "val", "test"],
+        help=(
+            "If `buffer_root` points to a split root, choose which split to evaluate. "
+            "Defaults to `test`. Use `none` to evaluate the buffer_root directory directly."
+        ),
     )
     parser.add_argument(
         "--pretrained_text_encoder_name_or_path",
@@ -166,20 +175,45 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-def apply_runtime_overrides(config: dict, *, buffer_root: str | None, image_root: str | None) -> dict:
+def _resolve_optional_path(path_like: str | None) -> Path | None:
+    if not path_like:
+        return None
+    path = Path(path_like)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _resolve_buffer_root_for_eval(buffer_root_like: str | None, buffer_split: str) -> Path | None:
+    buffer_root = _resolve_optional_path(buffer_root_like)
+    if buffer_root is None:
+        return None
+    if buffer_split != "none":
+        candidate = buffer_root / buffer_split
+        if (candidate / "stats.json").exists():
+            return candidate
+    return buffer_root
+
+
+def apply_runtime_overrides(
+    config: dict,
+    *,
+    buffer_root: str | None,
+    image_root: str | None,
+    buffer_split: str,
+) -> dict:
     if buffer_root is not None:
         config.setdefault("dataset", {})["buffer_root"] = buffer_root
     if image_root is not None:
         config.setdefault("dataset", {})["image_root"] = image_root
 
-    buffer_root = (
+    buffer_root = _resolve_buffer_root_for_eval(
         config.get("dataset", {}).get("buffer_root")
-        or config.get("dataset", {}).get("preprocessed_buffer_root")
+        or config.get("dataset", {}).get("preprocessed_buffer_root"),
+        buffer_split=buffer_split,
     )
     if buffer_root:
-        buffer_root = Path(buffer_root)
-        if not buffer_root.is_absolute():
-            buffer_root = Path.cwd() / buffer_root
+        config.setdefault("dataset", {})["buffer_root"] = str(buffer_root)
         stats_path = buffer_root / "stats.json"
         if stats_path.exists():
             with open(stats_path, "r", encoding="utf-8") as fp:
@@ -208,6 +242,7 @@ def build_model_and_dataset(args):
         load_config(args.config_path),
         buffer_root=args.buffer_root,
         image_root=args.image_root,
+        buffer_split=args.buffer_split,
     )
     device = resolve_device(args.device)
     weight_dtype = resolve_weight_dtype(args.mixed_precision, device)

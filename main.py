@@ -43,6 +43,16 @@ def parse_args(input_args=None):
         default=None,
         help="Optional runtime override for dataset.image_root in the YAML config.",
     )
+    parser.add_argument(
+        "--sample_buffer_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional runtime override for the evaluation/sampling dataset buffer root. "
+            "If omitted and `buffer_root` points to a split root, training uses `train/` "
+            "while sampling uses `val/` automatically."
+        ),
+    )
     
     parser.add_argument(
         "--output_dir",

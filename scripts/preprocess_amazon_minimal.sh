@@ -14,6 +14,7 @@ cd "$ROOT_DIR"
 : "${DOWNLOAD_WORKERS:=16}"
 : "${DOWNLOAD_TIMEOUT:=10}"
 : "${SEED:=0}"
+: "${SPLIT_MODE:=leave_last_two}"
 
 export PYTHONUNBUFFERED=1
 
@@ -28,5 +29,6 @@ python preprocess_amazon.py \
   --download-workers "${DOWNLOAD_WORKERS}" \
   --download-timeout "${DOWNLOAD_TIMEOUT}" \
   --seed "${SEED}" \
+  --split-mode "${SPLIT_MODE}" \
   --overwrite \
   "$@"

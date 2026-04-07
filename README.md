@@ -95,7 +95,26 @@ bash scripts/download_amazon_music_dataset.sh
 
 The preferred training input is the lightweight recommendation buffer produced by `preprocess_amazon.py`.
 
-The buffer contains:
+With the default `--split-mode leave_last_two`, preprocessing writes a split root:
+
+```text
+buffer/amazon_music/
+  split_manifest.json
+  train/
+    item_embeddings.npy
+    item_meta.json
+    item_map.json
+    user_map.json
+    stats.json
+    chunk_k/samples.npz
+    chunk_k/dirty_bit
+  val/
+    ...
+  test/
+    ...
+```
+
+Each split buffer contains:
 
 - `item_embeddings.npy`
 - `item_meta.json`
@@ -106,6 +125,12 @@ The buffer contains:
 - `chunk_k/dirty_bit`
 
 Each stored sample keeps only lightweight IDs and masks. Image tensors and item embeddings are reconstructed dynamically at training time from the global item store.
+
+Default split policy:
+
+- `train`: every user's targets except the last two
+- `val`: every user's second-to-last target
+- `test`: every user's last target
 
 If `item_embeddings.npy` is absent, preprocessing falls back to dummy random vectors for smoke testing. For meaningful recommendation training, generate real metadata-based embeddings first with `scripts/generate_amazon_item_embeddings.sh`.
 
@@ -141,7 +166,7 @@ python main.py \
 
 - [Recsys Server Workflow](docs/recsys_server_workflow.md)
 
-For real training on a Linux server, keep the large encoders local on disk and pass dataset paths at launch time instead of editing YAML by hand.
+For real training on a Linux server, keep the large encoders local on disk and pass the split root at launch time instead of editing YAML by hand. If the buffer root contains `train/val/test`, training automatically uses `train/` for optimization and `val/` for in-training sampling.
 
 ```bash
 TEXT_ENCODER_PATH=/models/t5-v1_1-xxl \
@@ -178,7 +203,7 @@ Important runtime notes:
 - `action_dim` is enforced to `128`
 - `action_chunk_size` is enforced to `1`
 - inference sampling never consumes the real target image
-- `main.py` now supports `--buffer_root` and `--image_root` overrides
+- `main.py` now supports `--buffer_root`, `--sample_buffer_root`, and `--image_root` overrides
 - `main.py` now supports `--report_to none` for smoke tests
 - `main.py` now supports `dummy` text and vision encoders for offline validation
 
@@ -191,6 +216,7 @@ python retrieve_topk.py \
   --config_path configs/recsys_amazon.yaml \
   --checkpoint /path/to/checkpoint \
   --buffer_root /path/to/buffer \
+  --buffer_split test \
   --image_root /path/to/images \
   --pretrained_text_encoder_name_or_path /path/to/t5 \
   --pretrained_vision_encoder_name_or_path /path/to/siglip \

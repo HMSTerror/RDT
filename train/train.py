@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
+import copy
 import json
 import logging
 import math
@@ -72,6 +73,90 @@ This is a RecSys-DiT model derived from {base_model}.
         f.write(yaml + model_card)
 
 
+def _resolve_optional_path(path_like):
+    if not path_like:
+        return None
+    path = Path(path_like)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _resolve_split_child(buffer_root: Path | None, split_name: str) -> Path | None:
+    if buffer_root is None:
+        return None
+    candidate = buffer_root / split_name
+    if (candidate / "stats.json").exists():
+        return candidate
+    return None
+
+
+def _resolve_train_and_sample_buffer_roots(
+    buffer_root_like,
+    sample_buffer_root_like=None,
+):
+    train_buffer_root = _resolve_optional_path(buffer_root_like)
+    sample_buffer_root = _resolve_optional_path(sample_buffer_root_like)
+
+    if train_buffer_root is None:
+        return None, sample_buffer_root
+
+    if _resolve_split_child(train_buffer_root, "train") is not None:
+        split_root = train_buffer_root
+        train_buffer_root = split_root / "train"
+        if sample_buffer_root is None:
+            sample_buffer_root = (
+                split_root / "val"
+                if (split_root / "val" / "stats.json").exists()
+                else train_buffer_root
+            )
+        elif _resolve_split_child(sample_buffer_root, "val") is not None:
+            sample_buffer_root = sample_buffer_root / "val"
+        return train_buffer_root, sample_buffer_root
+
+    if train_buffer_root.name == "train" and (train_buffer_root / "stats.json").exists():
+        if sample_buffer_root is None:
+            sibling_val = train_buffer_root.parent / "val"
+            sample_buffer_root = sibling_val if (sibling_val / "stats.json").exists() else train_buffer_root
+        elif _resolve_split_child(sample_buffer_root, "val") is not None:
+            sample_buffer_root = sample_buffer_root / "val"
+        return train_buffer_root, sample_buffer_root
+
+    if sample_buffer_root is not None and _resolve_split_child(sample_buffer_root, "val") is not None:
+        sample_buffer_root = sample_buffer_root / "val"
+    if sample_buffer_root is None:
+        sample_buffer_root = train_buffer_root
+    return train_buffer_root, sample_buffer_root
+
+
+def _sync_history_len_from_buffer_stats(config: dict, buffer_root: Path | None, logger, label: str) -> dict | None:
+    if buffer_root is None:
+        return None
+
+    stats_path = buffer_root / "stats.json"
+    if not stats_path.exists():
+        return None
+
+    with open(stats_path, "r", encoding="utf-8") as fp:
+        buffer_stats = json.load(fp)
+
+    buffer_history_len = int(buffer_stats["history_len"])
+    original_dataset_history_len = config["dataset"].get("history_len")
+    original_img_history_size = config["common"].get("img_history_size")
+    if (
+        original_dataset_history_len not in (None, buffer_history_len)
+        or original_img_history_size != buffer_history_len
+    ):
+        logger.warning(
+            f"Overriding history length from {label} buffer stats: "
+            f"dataset.history_len {original_dataset_history_len} -> {buffer_history_len}, "
+            f"common.img_history_size {original_img_history_size} -> {buffer_history_len}."
+        )
+    config["dataset"]["history_len"] = buffer_history_len
+    config["common"]["img_history_size"] = buffer_history_len
+    return buffer_stats
+
+
 def train(args, logger):
     # Read the config
     with open(args.config_path, "r") as fp:
@@ -82,32 +167,47 @@ def train(args, logger):
     if args.image_root is not None:
         config.setdefault("dataset", {})["image_root"] = args.image_root
 
-    buffer_root = (
+    configured_buffer_root = (
         config.get("dataset", {}).get("buffer_root")
         or config.get("dataset", {}).get("preprocessed_buffer_root")
     )
-    if buffer_root:
-        buffer_root = Path(buffer_root)
-        if not buffer_root.is_absolute():
-            buffer_root = Path.cwd() / buffer_root
-        stats_path = buffer_root / "stats.json"
-        if stats_path.exists():
-            with open(stats_path, "r", encoding="utf-8") as fp:
-                buffer_stats = json.load(fp)
-            buffer_history_len = int(buffer_stats["history_len"])
-            original_dataset_history_len = config["dataset"].get("history_len")
-            original_img_history_size = config["common"].get("img_history_size")
-            if (
-                original_dataset_history_len not in (None, buffer_history_len)
-                or original_img_history_size != buffer_history_len
-            ):
-                logger.warning(
-                    "Overriding history length from preprocessed buffer stats: "
-                    f"dataset.history_len {original_dataset_history_len} -> {buffer_history_len}, "
-                    f"common.img_history_size {original_img_history_size} -> {buffer_history_len}."
-                )
-            config["dataset"]["history_len"] = buffer_history_len
-            config["common"]["img_history_size"] = buffer_history_len
+    train_buffer_root, sample_buffer_root = _resolve_train_and_sample_buffer_roots(
+        configured_buffer_root,
+        args.sample_buffer_root,
+    )
+    if train_buffer_root is not None:
+        config.setdefault("dataset", {})["buffer_root"] = str(train_buffer_root)
+    _sync_history_len_from_buffer_stats(
+        config=config,
+        buffer_root=train_buffer_root,
+        logger=logger,
+        label="training",
+    )
+
+    sample_dataset_config = copy.deepcopy(config["dataset"])
+    if sample_buffer_root is not None:
+        sample_dataset_config["buffer_root"] = str(sample_buffer_root)
+    sample_buffer_stats = _sync_history_len_from_buffer_stats(
+        config={"dataset": sample_dataset_config, "common": copy.deepcopy(config["common"])},
+        buffer_root=sample_buffer_root,
+        logger=logger,
+        label="sampling",
+    )
+    if sample_buffer_stats is not None:
+        sample_history_len = int(sample_buffer_stats["history_len"])
+        train_history_len = int(config["dataset"]["history_len"])
+        if sample_history_len != train_history_len:
+            raise ValueError(
+                "Training and sampling buffers must share the same history length, "
+                f"but got train={train_history_len} and sample={sample_history_len}."
+            )
+        sample_dataset_config["history_len"] = sample_history_len
+
+    if train_buffer_root is not None or sample_buffer_root is not None:
+        logger.info(
+            "Resolved buffer roots: "
+            f"train={train_buffer_root}, sample={sample_buffer_root}"
+        )
 
     original_state_dim = config["common"].get("state_dim")
     original_action_chunk_size = config["common"].get("action_chunk_size")
@@ -311,7 +411,7 @@ def train(args, logger):
         cond_mask_prob=args.cond_mask_prob,
     )
     sample_dataset = VLAConsumerDataset(
-        config=config["dataset"],
+        config=sample_dataset_config,
         image_processor=image_processor,
         img_history_size=config["common"]["img_history_size"],
         image_aug=False,

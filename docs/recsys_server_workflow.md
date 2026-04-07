@@ -4,9 +4,9 @@ This document describes the recommended end-to-end server workflow:
 
 1. download the raw Amazon Musical Instruments dataset into `data/`
 2. generate real metadata-based `item_embeddings.npy`
-3. preprocess the raw files into a lightweight buffer
-4. train RecSys-DiT
-5. run offline top-k retrieval evaluation
+3. preprocess the raw files into split-aware train/val/test buffers
+4. train RecSys-DiT on `train/` while sampling on `val/`
+5. run offline top-k retrieval evaluation on `test/`
 
 ## 1. Directory Layout
 
@@ -98,7 +98,7 @@ data/images/{asin}.jpg
 
 If images are missing, preprocessing can optionally try to download them from metadata URLs unless you pass `--skip-download`.
 
-## 6. Preprocess Into a Lightweight Buffer
+## 6. Preprocess Into Split Buffers
 
 The most convenient wrapper is:
 
@@ -111,6 +111,27 @@ OUTPUT_ROOT=/data/amazon_music_buffer \
 bash scripts/preprocess_amazon_minimal.sh
 ```
 
+By default this creates:
+
+```bash
+/data/amazon_music_buffer/train
+/data/amazon_music_buffer/val
+/data/amazon_music_buffer/test
+/data/amazon_music_buffer/split_manifest.json
+```
+
+Split policy:
+
+- `train`: each user's targets except the final two
+- `val`: each user's second-to-last target
+- `test`: each user's final target
+
+If you need the legacy single-buffer layout, set:
+
+```bash
+SPLIT_MODE=none bash scripts/preprocess_amazon_minimal.sh
+```
+
 For a smaller debug build:
 
 ```bash
@@ -119,10 +140,15 @@ META_PATH=data/Amazon_Music_And_Instruments/meta_Musical_Instruments.json \
 EMBEDDING_PATH=data/Amazon_Music_And_Instruments/item_embeddings.npy \
 IMAGE_ROOT=data/images \
 OUTPUT_ROOT=/data/amazon_music_buffer_debug \
-bash scripts/preprocess_amazon_minimal.sh --max-samples 10000 --skip-download
+SPLIT_MODE=none bash scripts/preprocess_amazon_minimal.sh --max-samples 10000 --skip-download
 ```
 
 ## 7. Train on the Server
+
+Use the server training wrapper. When `BUFFER_ROOT` points to the split root, the trainer automatically loads:
+
+- `train/` for optimization
+- `val/` for in-training sampling metrics
 
 Use the server training wrapper:
 
@@ -170,6 +196,7 @@ python retrieve_topk.py \
   --config_path configs/recsys_amazon.yaml \
   --checkpoint /exp/recsys_dit/run_001 \
   --buffer_root /data/amazon_music_buffer \
+  --buffer_split test \
   --image_root data/images \
   --pretrained_text_encoder_name_or_path /models/t5-v1_1-xxl \
   --pretrained_vision_encoder_name_or_path /models/siglip-base-patch16-224 \
@@ -186,6 +213,7 @@ python retrieve_topk.py \
   --config_path configs/recsys_amazon.yaml \
   --checkpoint /exp/recsys_dit/run_001 \
   --buffer_root /data/amazon_music_buffer \
+  --buffer_split test \
   --image_root data/images \
   --pretrained_text_encoder_name_or_path /models/t5-v1_1-xxl \
   --pretrained_vision_encoder_name_or_path /models/siglip-base-patch16-224 \
@@ -227,6 +255,7 @@ python retrieve_topk.py \
   --config_path configs/recsys_amazon.yaml \
   --checkpoint /exp/recsys_dit/run_001 \
   --buffer_root /data/amazon_music_buffer \
+  --buffer_split test \
   --image_root data/images \
   --pretrained_text_encoder_name_or_path /models/t5-v1_1-xxl \
   --pretrained_vision_encoder_name_or_path /models/siglip-base-patch16-224 \
@@ -274,4 +303,5 @@ python main.py \
   `data/Amazon_Music_And_Instruments/`
 - If product images are missing and the server has no internet access, add `--skip-download` during preprocessing.
 - If `item_embeddings.npy` is absent, preprocessing falls back to dummy vectors intended only for smoke testing.
+- `retrieve_topk.py` defaults to evaluating the `test/` split when `buffer_root` points to a split root.
 - If GPU memory is tight, reduce `train_batch_size` first and then increase `gradient_accumulation_steps`.
