@@ -21,6 +21,7 @@ models/
   rdt_runner.py
 scripts/
   download_amazon_music_dataset.sh
+  generate_amazon_item_embeddings.sh
   train_recsys_minimal.sh
   train_recsys_server.sh
 train/
@@ -58,6 +59,18 @@ This script creates:
 - `data/Amazon_Music_And_Instruments/Musical_Instruments_5.json`
 - `data/Amazon_Music_And_Instruments/meta_Musical_Instruments.json`
 
+To generate metadata-based semantic item embeddings aligned with the buffer:
+
+```bash
+TEXT_MODEL_NAME_OR_PATH=/path/to/local_t5_or_hf_id \
+bash scripts/generate_amazon_item_embeddings.sh
+```
+
+This creates:
+
+- `data/Amazon_Music_And_Instruments/item_embeddings.npy`
+- `data/Amazon_Music_And_Instruments/item_embeddings.meta.json`
+
 If you want to override the target folder:
 
 ```bash
@@ -93,6 +106,8 @@ The buffer contains:
 - `chunk_k/dirty_bit`
 
 Each stored sample keeps only lightweight IDs and masks. Image tensors and item embeddings are reconstructed dynamically at training time from the global item store.
+
+If `item_embeddings.npy` is absent, preprocessing falls back to dummy random vectors for smoke testing. For meaningful recommendation training, generate real metadata-based embeddings first with `scripts/generate_amazon_item_embeddings.sh`.
 
 ## Minimal Smoke Run
 
@@ -175,6 +190,8 @@ Run offline retrieval evaluation with:
 python retrieve_topk.py \
   --config_path configs/recsys_amazon.yaml \
   --checkpoint /path/to/checkpoint \
+  --buffer_root /path/to/buffer \
+  --image_root /path/to/images \
   --pretrained_text_encoder_name_or_path /path/to/t5 \
   --pretrained_vision_encoder_name_or_path /path/to/siglip \
   --topk 5,10,20

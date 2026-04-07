@@ -93,11 +93,14 @@ Reviews : ${REVIEWS_JSON}
 Meta    : ${META_JSON}
 
 Optional next step:
+  TEXT_MODEL_NAME_OR_PATH=/path/to/local_t5_or_hf_id bash scripts/generate_amazon_item_embeddings.sh
   bash scripts/preprocess_amazon_minimal.sh
 
 Notes:
   - item_embeddings.npy is not downloaded by this script.
-  - preprocess_amazon.py will generate dummy 128-d item embeddings if that file is absent.
+  - You can generate metadata-based semantic embeddings with:
+      bash scripts/generate_amazon_item_embeddings.sh
+  - preprocess_amazon.py will generate dummy 128-d item embeddings only if that file is absent.
   - If your server lacks CA certificates, you can temporarily use:
       INSECURE_SKIP_TLS_VERIFY=1 bash scripts/download_amazon_music_dataset.sh
   - A safer option is:

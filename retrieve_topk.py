@@ -42,6 +42,18 @@ def parse_args():
         help="Checkpoint file or directory to load.",
     )
     parser.add_argument(
+        "--buffer_root",
+        type=str,
+        default=None,
+        help="Optional runtime override for dataset.buffer_root in the YAML config.",
+    )
+    parser.add_argument(
+        "--image_root",
+        type=str,
+        default=None,
+        help="Optional runtime override for dataset.image_root in the YAML config.",
+    )
+    parser.add_argument(
         "--pretrained_text_encoder_name_or_path",
         type=str,
         required=True,
@@ -151,6 +163,15 @@ def load_config(config_path: str) -> dict:
     with open(config_path, "r", encoding="utf-8") as fp:
         config = yaml.safe_load(fp)
 
+    return config
+
+
+def apply_runtime_overrides(config: dict, *, buffer_root: str | None, image_root: str | None) -> dict:
+    if buffer_root is not None:
+        config.setdefault("dataset", {})["buffer_root"] = buffer_root
+    if image_root is not None:
+        config.setdefault("dataset", {})["image_root"] = image_root
+
     buffer_root = (
         config.get("dataset", {}).get("buffer_root")
         or config.get("dataset", {}).get("preprocessed_buffer_root")
@@ -183,7 +204,11 @@ def build_vision_encoder(vision_tower_name: str, config: dict):
 
 
 def build_model_and_dataset(args):
-    config = load_config(args.config_path)
+    config = apply_runtime_overrides(
+        load_config(args.config_path),
+        buffer_root=args.buffer_root,
+        image_root=args.image_root,
+    )
     device = resolve_device(args.device)
     weight_dtype = resolve_weight_dtype(args.mixed_precision, device)
 
@@ -291,9 +316,20 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
             state_dict = payload
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        print(f"[warn] Missing keys when loading checkpoint: {len(missing_keys)}")
-        preview = missing_keys[:10]
+    allowed_missing_keys = {
+        "condition_encoder.text_encoder.encoder.embed_tokens.weight",
+    }
+    real_missing_keys = [key for key in missing_keys if key not in allowed_missing_keys]
+    expected_missing_keys = [key for key in missing_keys if key in allowed_missing_keys]
+
+    if expected_missing_keys:
+        print(
+            "[info] Ignoring expected shared-weight missing keys when loading checkpoint: "
+            f"{expected_missing_keys}"
+        )
+    if real_missing_keys:
+        print(f"[warn] Missing keys when loading checkpoint: {len(real_missing_keys)}")
+        preview = real_missing_keys[:10]
         print(f"[warn] Missing preview: {preview}")
     if unexpected_keys:
         print(f"[warn] Unexpected keys when loading checkpoint: {len(unexpected_keys)}")
