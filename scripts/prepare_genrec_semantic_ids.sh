@@ -27,11 +27,15 @@ if [[ "${ENABLE_IMAGE:-1}" == "1" ]]; then
   echo "========== [2/7] image embeddings =========="
   OUTPUT_PATH="${IMAGE_EMBED_PATH}" \
   REVIEWS_PATH="${REVIEWS_PATH}" \
+  META_PATH="${META_PATH}" \
   IMAGE_ROOT="${IMAGE_ROOT}" \
   VISION_MODEL_NAME_OR_PATH="${VISION_MODEL_NAME_OR_PATH:-google/siglip-base-patch16-224}" \
   DEVICE="${IMAGE_DEVICE:-${DEVICE:-}}" \
   DTYPE="${IMAGE_DTYPE:-${DTYPE:-auto}}" \
   LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}" \
+  DOWNLOAD_MISSING="${DOWNLOAD_MISSING_IMAGES:-0}" \
+  DOWNLOAD_WORKERS="${IMAGE_DOWNLOAD_WORKERS:-16}" \
+  DOWNLOAD_TIMEOUT="${IMAGE_DOWNLOAD_TIMEOUT:-10}" \
   bash scripts/generate_amazon_image_embeddings.sh
 else
   echo "========== [2/7] image embeddings skipped =========="

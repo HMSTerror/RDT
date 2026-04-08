@@ -16,10 +16,15 @@ This script:
 from __future__ import annotations
 
 import argparse
+import ast
+import io
 import json
 import sys
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -45,6 +50,60 @@ from preprocess_amazon import (  # noqa: E402
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 
+def open_text(path: Path):
+    if path.suffix.lower() == ".gz":
+        import gzip
+
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r", encoding="utf-8")
+
+
+def parse_json_record(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        try:
+            return ast.literal_eval(line)
+        except (ValueError, SyntaxError):
+            return None
+
+
+def iter_json_records(path: Path, desc: str) -> Iterator[dict]:
+    with open_text(path) as handle:
+        for line in tqdm(handle, desc=desc, unit="line"):
+            record = parse_json_record(line)
+            if record is not None:
+                yield record
+
+
+def clean_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = " ".join(str(x) for x in value if x)
+    return " ".join(str(value).split())
+
+
+def choose_image_url(meta: dict) -> str:
+    candidates: List[str] = []
+    for key in ("imUrl", "imageURL", "imageURLHighRes"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        elif isinstance(value, list):
+            candidates.extend([str(x).strip() for x in value if str(x).strip()])
+    return candidates[0] if candidates else ""
+
+
+def filename_from_url(image_url: str) -> str:
+    if not image_url:
+        return ""
+    return image_url.split("?")[0].rsplit("/", 1)[-1].strip()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -57,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/Amazon_Music_And_Instruments/Musical_Instruments_5.json"),
         help="Path to the raw Amazon review JSON / JSON.GZ file.",
+    )
+    parser.add_argument(
+        "--meta-path",
+        type=Path,
+        default=Path("data/Amazon_Music_And_Instruments/meta_Musical_Instruments.json"),
+        help="Path to metadata JSON / JSON.GZ used for image URL and filename hints.",
     )
     parser.add_argument(
         "--image-root",
@@ -116,6 +181,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed used by PCA.",
+    )
+    parser.add_argument(
+        "--download-missing",
+        action="store_true",
+        help="Try downloading missing images from metadata URLs before encoding.",
+    )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=16,
+        help="Thread workers used when --download-missing is enabled.",
+    )
+    parser.add_argument(
+        "--download-timeout",
+        type=float,
+        default=10.0,
+        help="Per-request timeout in seconds when downloading missing images.",
+    )
+    parser.add_argument(
+        "--allow-all-missing",
+        action="store_true",
+        help="Allow output even when all items are missing images.",
     )
     return parser.parse_args()
 
@@ -181,23 +268,190 @@ def build_aligned_item_ids(reviews_path: Path) -> List[str]:
     return ordered_item_ids
 
 
-def resolve_local_image_path(image_root: Path, item_id: str) -> Path | None:
+def load_meta_image_lookup(
+    meta_path: Path,
+    target_item_ids: Sequence[str],
+) -> Dict[str, dict]:
+    target_set = set(target_item_ids)
+    lookup: Dict[str, dict] = {}
+    for record in iter_json_records(meta_path, desc="Reading metadata for image lookup"):
+        item_id = clean_text(record.get("asin", ""))
+        if not item_id or item_id not in target_set:
+            continue
+        image_url = choose_image_url(record)
+        image_filename = filename_from_url(image_url)
+        image_path = clean_text(record.get("image_path", ""))
+        lookup[item_id] = {
+            "image_url": image_url,
+            "image_filename": image_filename,
+            "image_path": image_path,
+        }
+        if len(lookup) == len(target_set):
+            break
+    print(f"[metadata] image hints for {len(lookup)}/{len(target_item_ids)} aligned items")
+    return lookup
+
+
+def build_recursive_image_index(image_root: Path) -> tuple[Dict[str, Path], Dict[str, Path], int]:
+    by_name: Dict[str, Path] = {}
+    by_stem: Dict[str, Path] = {}
+    num_image_files = 0
+    if not image_root.exists():
+        return by_name, by_stem, num_image_files
+
+    for path in image_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        num_image_files += 1
+        name_key = path.name.lower()
+        stem_key = path.stem.lower()
+        if name_key not in by_name:
+            by_name[name_key] = path
+        if stem_key not in by_stem:
+            by_stem[stem_key] = path
+
+    return by_name, by_stem, num_image_files
+
+
+def resolve_local_image_path(
+    image_root: Path,
+    item_id: str,
+    *,
+    meta_lookup: Dict[str, dict],
+    index_by_name: Dict[str, Path],
+    index_by_stem: Dict[str, Path],
+) -> Path | None:
+    candidates: List[Path] = []
+
     for suffix in IMAGE_EXTENSIONS:
-        candidate = image_root / f"{item_id}{suffix}"
-        if candidate.exists():
+        candidates.append(image_root / f"{item_id}{suffix}")
+
+    meta = meta_lookup.get(item_id, {})
+    image_path = clean_text(meta.get("image_path", ""))
+    image_filename = clean_text(meta.get("image_filename", ""))
+
+    if image_path:
+        candidates.append(image_root / image_path)
+    if image_filename:
+        candidates.append(image_root / image_filename)
+        candidates.append(image_root / item_id / image_filename)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
             return candidate
+
+    if image_filename:
+        candidate = index_by_name.get(image_filename.lower())
+        if candidate is not None and candidate.exists():
+            return candidate
+
+    candidate = index_by_stem.get(item_id.lower())
+    if candidate is not None and candidate.exists():
+        return candidate
+
     return None
+
+
+def _download_one_image(
+    item_id: str,
+    *,
+    meta_lookup: Dict[str, dict],
+    image_root: Path,
+    timeout: float,
+) -> bool:
+    meta = meta_lookup.get(item_id, {})
+    image_url = clean_text(meta.get("image_url", ""))
+    if not image_url:
+        return False
+
+    output_path = image_root / f"{item_id}.jpg"
+    if output_path.exists():
+        return True
+
+    request = urllib.request.Request(
+        image_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; GenRec-Image-Embedding/1.0)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+            payload = response.read()
+        with Image.open(io.BytesIO(payload)) as image:
+            image = image.convert("RGB")
+            image.save(output_path, format="JPEG", quality=95)
+        return True
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def prefetch_missing_images(
+    item_ids: Sequence[str],
+    *,
+    image_root: Path,
+    meta_lookup: Dict[str, dict],
+    index_by_name: Dict[str, Path],
+    index_by_stem: Dict[str, Path],
+    num_workers: int,
+    timeout: float,
+) -> tuple[int, int]:
+    pending: List[str] = []
+    for item_id in item_ids:
+        if resolve_local_image_path(
+            image_root,
+            item_id,
+            meta_lookup=meta_lookup,
+            index_by_name=index_by_name,
+            index_by_stem=index_by_stem,
+        ) is not None:
+            continue
+        if clean_text(meta_lookup.get(item_id, {}).get("image_url", "")):
+            pending.append(item_id)
+
+    if not pending:
+        print("[images] no downloadable missing items found")
+        return 0, 0
+
+    print(
+        f"[images] prefetch missing: pending={len(pending)} workers={max(1, int(num_workers))} timeout={timeout}s"
+    )
+    success = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(num_workers))) as executor:
+        futures = {
+            executor.submit(
+                _download_one_image,
+                item_id,
+                meta_lookup=meta_lookup,
+                image_root=image_root,
+                timeout=timeout,
+            ): item_id
+            for item_id in pending
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Downloading images", unit="img"):
+            if future.result():
+                success += 1
+    return len(pending), success
 
 
 def load_images_for_batch(
     image_root: Path,
     item_ids: Sequence[str],
+    *,
+    meta_lookup: Dict[str, dict],
+    index_by_name: Dict[str, Path],
+    index_by_stem: Dict[str, Path],
 ) -> tuple[List[Image.Image], torch.Tensor]:
     images: List[Image.Image] = []
     missing_mask = torch.zeros(len(item_ids), dtype=torch.bool)
 
     for idx, item_id in enumerate(item_ids):
-        image_path = resolve_local_image_path(image_root, item_id)
+        image_path = resolve_local_image_path(
+            image_root,
+            item_id,
+            meta_lookup=meta_lookup,
+            index_by_name=index_by_name,
+            index_by_stem=index_by_stem,
+        )
         if image_path is None:
             missing_mask[idx] = True
             images.append(Image.new("RGB", (224, 224), color=(0, 0, 0)))
@@ -238,17 +492,26 @@ def encode_images(
     item_ids: Sequence[str],
     *,
     image_root: Path,
+    meta_lookup: Dict[str, dict],
+    index_by_name: Dict[str, Path],
+    index_by_stem: Dict[str, Path],
     processor: SiglipImageProcessor,
     model: SiglipVisionModel,
     device: torch.device,
     batch_size: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     all_embeddings: List[torch.Tensor] = []
     missing_count = 0
 
     for start in tqdm(range(0, len(item_ids), batch_size), desc="Encoding item images", unit="batch"):
         batch_item_ids = list(item_ids[start : start + batch_size])
-        images, missing_mask = load_images_for_batch(image_root, batch_item_ids)
+        images, missing_mask = load_images_for_batch(
+            image_root,
+            batch_item_ids,
+            meta_lookup=meta_lookup,
+            index_by_name=index_by_name,
+            index_by_stem=index_by_stem,
+        )
         missing_count += int(missing_mask.sum().item())
 
         encoded = processor(images=images, return_tensors="pt")
@@ -262,7 +525,7 @@ def encode_images(
         all_embeddings.append(pooled.cpu())
 
     print(f"[images] missing_or_unreadable={missing_count}/{len(item_ids)}")
-    return torch.cat(all_embeddings, dim=0)
+    return torch.cat(all_embeddings, dim=0), missing_count
 
 
 def main() -> None:
@@ -278,20 +541,55 @@ def main() -> None:
     args.image_root.mkdir(parents=True, exist_ok=True)
 
     ordered_item_ids = build_aligned_item_ids(args.reviews_path)
+    meta_lookup = load_meta_image_lookup(args.meta_path, ordered_item_ids)
+    index_by_name, index_by_stem, indexed_files = build_recursive_image_index(args.image_root)
+    print(
+        f"[images] indexed local files under {args.image_root}: "
+        f"{indexed_files} (name_index={len(index_by_name)}, stem_index={len(index_by_stem)})"
+    )
+
+    if args.download_missing:
+        pending, success = prefetch_missing_images(
+            ordered_item_ids,
+            image_root=args.image_root,
+            meta_lookup=meta_lookup,
+            index_by_name=index_by_name,
+            index_by_stem=index_by_stem,
+            num_workers=args.download_workers,
+            timeout=args.download_timeout,
+        )
+        if pending > 0:
+            print(f"[images] download success={success}/{pending}")
+            index_by_name, index_by_stem, indexed_files = build_recursive_image_index(args.image_root)
+            print(
+                f"[images] re-indexed local files: "
+                f"{indexed_files} (name_index={len(index_by_name)}, stem_index={len(index_by_stem)})"
+            )
+
     processor, model = load_vision_backbone(
         args.vision_model_name_or_path,
         device=device,
         dtype=dtype,
         local_files_only=args.local_files_only,
     )
-    embeddings = encode_images(
+    embeddings, missing_count = encode_images(
         ordered_item_ids,
         image_root=args.image_root,
+        meta_lookup=meta_lookup,
+        index_by_name=index_by_name,
+        index_by_stem=index_by_stem,
         processor=processor,
         model=model,
         device=device,
         batch_size=args.batch_size,
     )
+    if missing_count == len(ordered_item_ids) and not args.allow_all_missing:
+        raise RuntimeError(
+            "All items are missing/unreadable images. "
+            "Check IMAGE_ROOT, file naming, and metadata URL availability; "
+            "or rerun with --download-missing. "
+            "If you intentionally want zero-image embeddings, pass --allow-all-missing."
+        )
     reduced = reduce_to_target_dim(embeddings, output_dim=args.output_dim, seed=args.seed)
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,9 +602,11 @@ def main() -> None:
         "output_path": str(args.output_path),
         "vision_model_name_or_path": args.vision_model_name_or_path,
         "num_items": int(len(ordered_item_ids)),
+        "missing_or_unreadable": int(missing_count),
         "output_dim": int(args.output_dim),
         "dtype": str(dtype),
         "local_files_only": bool(args.local_files_only),
+        "download_missing": bool(args.download_missing),
     }
     with open(sidecar_path, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, indent=2, ensure_ascii=False)

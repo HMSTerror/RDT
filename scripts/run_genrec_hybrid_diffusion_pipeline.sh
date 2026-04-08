@@ -29,6 +29,7 @@ fi
 : "${ENABLE_CF:=1}"
 : "${ENABLE_FUSION:=1}"
 : "${CF_METHOD:=item2vec}"
+: "${DOWNLOAD_MISSING_IMAGES:=1}"
 
 export TEXT_MODEL_NAME_OR_PATH
 export VISION_MODEL_NAME_OR_PATH
@@ -39,6 +40,7 @@ export ENABLE_IMAGE
 export ENABLE_CF
 export ENABLE_FUSION
 export CF_METHOD
+export DOWNLOAD_MISSING_IMAGES
 
 mkdir -p "${LOG_DIR}"
 
