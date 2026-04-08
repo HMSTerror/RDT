@@ -81,6 +81,13 @@ def main() -> None:
         raise ValueError(
             f"Expected `embeddings_path` to contain a 2D matrix, got {tuple(embeddings.shape)}."
         )
+    non_finite = int(np.count_nonzero(~np.isfinite(embeddings)))
+    if non_finite > 0:
+        print(
+            f"[warn] Found {non_finite} non-finite values in embeddings. "
+            "Replacing NaN/Inf with 0 before quantization."
+        )
+        embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=0.0, neginf=0.0)
 
     item_map = load_item_map(args.item_map_path)
     if embeddings.shape[0] != len(item_map):
