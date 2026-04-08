@@ -149,6 +149,33 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--diffusion_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the diffusion denoising loss against the trainable target item latent.",
+    )
+    parser.add_argument(
+        "--ranking_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the ranking cross-entropy loss over the trainable item latent table.",
+    )
+    parser.add_argument(
+        "--ranking_temperature",
+        type=float,
+        default=0.07,
+        help="Temperature used for ranking logits against the item latent table.",
+    )
+    parser.add_argument(
+        "--item_latent_align_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional weight that keeps the trainable item latent table close to the "
+            "static buffer item embeddings used for initialization."
+        ),
+    )
+    parser.add_argument(
         "--image_aug",
         action="store_true",
         default=False,
@@ -166,11 +193,20 @@ def parse_args(input_args=None):
         default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
+            ' "constant", "constant_with_warmup", "constant_then_linear"]'
         ),
     )
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument(
+        "--lr_decay_start_step",
+        type=int,
+        default=0,
+        help=(
+            "For `constant_then_linear`, keep the learning rate constant for this many "
+            "optimization steps and then linearly decay it to zero."
+        ),
     )
     parser.add_argument(
         "--lr_num_cycles",

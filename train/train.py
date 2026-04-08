@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import diffusers
+import numpy as np
 import torch
 import transformers
 import yaml
@@ -30,6 +31,7 @@ from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
 from huggingface_hub import create_repo, upload_folder
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm.auto import tqdm
 
 from models.multimodal_encoder.clip_encoder import CLIPVisionTower
@@ -129,6 +131,44 @@ def _resolve_train_and_sample_buffer_roots(
     return train_buffer_root, sample_buffer_root
 
 
+def _safe_pre_accelerator_log(logger, level: str, message: str) -> None:
+    try:
+        getattr(logger, level)(message)
+    except RuntimeError as exc:
+        if "initialize the accelerate state" not in str(exc):
+            raise
+        fallback_logger = logging.getLogger(__name__)
+        getattr(fallback_logger, level)(message)
+
+
+def _build_lr_scheduler(args, optimizer, max_train_steps: int):
+    if args.lr_scheduler != "constant_then_linear":
+        return get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=max_train_steps * args.gradient_accumulation_steps,
+            num_cycles=args.lr_num_cycles,
+            power=args.lr_power,
+        )
+
+    total_scheduler_steps = max(1, max_train_steps * args.gradient_accumulation_steps)
+    decay_start_step = max(0, int(args.lr_decay_start_step) * args.gradient_accumulation_steps)
+    decay_start_step = min(decay_start_step, total_scheduler_steps)
+
+    def lr_lambda(current_step: int) -> float:
+        if total_scheduler_steps <= decay_start_step:
+            return 1.0
+        if current_step <= decay_start_step:
+            return 1.0
+
+        decay_span = total_scheduler_steps - decay_start_step
+        remaining = total_scheduler_steps - current_step
+        return max(0.0, remaining / decay_span)
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def _sync_history_len_from_buffer_stats(config: dict, buffer_root: Path | None, logger, label: str) -> dict | None:
     if buffer_root is None:
         return None
@@ -147,14 +187,33 @@ def _sync_history_len_from_buffer_stats(config: dict, buffer_root: Path | None, 
         original_dataset_history_len not in (None, buffer_history_len)
         or original_img_history_size != buffer_history_len
     ):
-        logger.warning(
+        _safe_pre_accelerator_log(
+            logger,
+            "warning",
             f"Overriding history length from {label} buffer stats: "
             f"dataset.history_len {original_dataset_history_len} -> {buffer_history_len}, "
-            f"common.img_history_size {original_img_history_size} -> {buffer_history_len}."
+            f"common.img_history_size {original_img_history_size} -> {buffer_history_len}.",
         )
     config["dataset"]["history_len"] = buffer_history_len
     config["common"]["img_history_size"] = buffer_history_len
     return buffer_stats
+
+
+def _load_item_latent_init(buffer_root: Path | None) -> torch.Tensor | None:
+    if buffer_root is None:
+        return None
+
+    item_embeddings_path = buffer_root / "item_embeddings.npy"
+    if not item_embeddings_path.exists():
+        return None
+
+    item_embeddings = np.load(item_embeddings_path, mmap_mode="r")
+    if item_embeddings.ndim != 2 or item_embeddings.shape[1] != 128:
+        raise ValueError(
+            "Expected buffer `item_embeddings.npy` with shape [num_items, 128], "
+            f"got {tuple(item_embeddings.shape)}."
+        )
+    return torch.from_numpy(np.asarray(item_embeddings, dtype=np.float32).copy())
 
 
 def train(args, logger):
@@ -204,9 +263,11 @@ def train(args, logger):
         sample_dataset_config["history_len"] = sample_history_len
 
     if train_buffer_root is not None or sample_buffer_root is not None:
-        logger.info(
+        _safe_pre_accelerator_log(
+            logger,
+            "info",
             "Resolved buffer roots: "
-            f"train={train_buffer_root}, sample={sample_buffer_root}"
+            f"train={train_buffer_root}, sample={sample_buffer_root}",
         )
 
     original_state_dim = config["common"].get("state_dim")
@@ -217,16 +278,28 @@ def train(args, logger):
         or original_action_chunk_size != 1
         or original_hidden_size != 1024
     ):
-        logger.warning(
+        _safe_pre_accelerator_log(
+            logger,
+            "warning",
             "Overriding legacy config for RecSys-DiT: "
             f"state_dim {original_state_dim} -> 128, "
             f"action_chunk_size {original_action_chunk_size} -> 1, "
-            f"rdt.hidden_size {original_hidden_size} -> 1024."
+            f"rdt.hidden_size {original_hidden_size} -> 1024.",
         )
     config["common"]["state_dim"] = 128
     config["common"]["action_chunk_size"] = 1
     config["model"]["state_token_dim"] = 128
     config["model"]["rdt"]["hidden_size"] = 1024
+    item_latent_init = _load_item_latent_init(train_buffer_root)
+    num_items = int(item_latent_init.shape[0]) if item_latent_init is not None else None
+    if item_latent_init is None and args.ranking_loss_weight > 0:
+        _safe_pre_accelerator_log(
+            logger,
+            "warning",
+            "Ranking loss is enabled but no buffer item_embeddings.npy was found for "
+            "initializing a trainable item latent table. Training will fall back to "
+            "diffusion-only supervision.",
+        )
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     report_to = None if args.report_to == "none" else args.report_to
@@ -330,7 +403,19 @@ def train(args, logger):
         and not os.path.isfile(args.pretrained_model_name_or_path)
     ):
         logger.info("Constructing model from pretrained checkpoint.")
-        rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
+        rdt = RDTRunner.from_pretrained(
+            args.pretrained_model_name_or_path,
+            action_dim=config["common"]["state_dim"],
+            pred_horizon=config["common"]["action_chunk_size"],
+            config=config["model"],
+            dtype=weight_dtype,
+            num_items=num_items,
+            item_latent_init=item_latent_init,
+            diffusion_loss_weight=args.diffusion_loss_weight,
+            ranking_loss_weight=args.ranking_loss_weight,
+            ranking_temperature=args.ranking_temperature,
+            item_latent_align_weight=args.item_latent_align_weight,
+        )
     else:
         logger.info("Constructing model from provided config.")
         rdt = RDTRunner(
@@ -338,6 +423,20 @@ def train(args, logger):
             pred_horizon=config["common"]["action_chunk_size"],
             config=config["model"],
             dtype=weight_dtype,
+            num_items=num_items,
+            item_latent_init=item_latent_init,
+            diffusion_loss_weight=args.diffusion_loss_weight,
+            ranking_loss_weight=args.ranking_loss_weight,
+            ranking_temperature=args.ranking_temperature,
+            item_latent_align_weight=args.item_latent_align_weight,
+        )
+    if getattr(rdt, "has_trainable_item_latents", lambda: False)():
+        logger.info(
+            "Initialized trainable item latent table with "
+            f"{rdt.num_items} items; diffusion_loss_weight={args.diffusion_loss_weight}, "
+            f"ranking_loss_weight={args.ranking_loss_weight}, "
+            f"ranking_temperature={args.ranking_temperature}, "
+            f"item_latent_align_weight={args.item_latent_align_weight}."
         )
 
     history_len = max(1, int(config["dataset"].get("history_len", config["common"]["img_history_size"])))
@@ -446,13 +545,10 @@ def train(args, logger):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
+    lr_scheduler = _build_lr_scheduler(
+        args=args,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-        num_cycles=args.lr_num_cycles,
-        power=args.lr_power,
+        max_train_steps=args.max_train_steps,
     )
 
     # Prepare everything with our `accelerator`.
@@ -567,13 +663,20 @@ def train(args, logger):
                     dtype=torch.float32,
                 )
 
-                loss = rdt(
+                target_item_ids = batch["target_item_ids"].to(
+                    device=accelerator.device,
+                    dtype=torch.long,
+                )
+
+                loss, loss_dict = rdt(
                     history_id_embeds=history_id_embeds,
                     history_pixel_values=history_pixel_values,
                     target_pixel_values=target_pixel_values,
                     text=batch["text"],
                     action_gt=target_embeds,
+                    target_item_ids=target_item_ids,
                     ctrl_freqs=ctrl_freqs,
+                    return_loss_dict=True,
                 )
 
                 accelerator.backward(loss)
@@ -609,6 +712,12 @@ def train(args, logger):
                         accelerator.log(sample_loss_for_log, step=global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if "diffusion_loss" in loss_dict:
+                logs["diff_loss"] = float(loss_dict["diffusion_loss"].item())
+            if "ranking_loss" in loss_dict:
+                logs["rank_loss"] = float(loss_dict["ranking_loss"].item())
+            if "item_latent_align_loss" in loss_dict:
+                logs["align_loss"] = float(loss_dict["item_latent_align_loss"].item())
             progress_bar.set_postfix(**logs)
             if report_to is not None:
                 accelerator.log(logs, step=global_step)

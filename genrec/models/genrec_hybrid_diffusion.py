@@ -1,0 +1,613 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from timm.models.vision_transformer import RmsNorm
+
+from genrec.contracts import SemanticIdBatch
+from models.rdt.blocks import TimestepEmbedder
+
+from .condition_projector import ConditionBranchProjector
+from .genrec_dit import GenRecDiTBlock
+
+
+@dataclass
+class HybridDiffusionOutput:
+    prediction: torch.Tensor
+    denoised_latents: torch.Tensor
+    target_positions: torch.Tensor
+    hidden_states: torch.Tensor
+
+
+class GenRecHybridDiffusionRunner(nn.Module):
+    """
+    Hybrid GenRec + Diffusion runner:
+    - history/context is still semantic-ID tokenized
+    - target is a continuous latent denoised with diffusion
+    """
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        vocab_sizes: list[int],
+        max_seq_len: int,
+        max_history_len: int,
+        latent_dim: int = 128,
+        prediction_type: str = "epsilon",
+        num_train_timesteps: int = 1000,
+        beta_schedule: str = "squaredcos_cap_v2",
+        hidden_size: int = 1024,
+        depth: int = 12,
+        num_heads: int = 16,
+        num_special_tokens: int = 5,
+        pad_token_id: int = 0,
+        mask_token_id: int = 1,
+        text_cond_dim: int | None = None,
+        image_cond_dim: int | None = None,
+        cf_cond_dim: int | None = None,
+        use_text_history: bool = True,
+        use_text_pooled: bool = True,
+        use_text_target: bool = False,
+        use_image_history: bool = True,
+        use_image_pooled: bool = True,
+        use_image_target: bool = False,
+        use_cf_history: bool = True,
+        use_cf_pooled: bool = True,
+        use_cf_target: bool = False,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.vocab_sizes = [int(value) for value in vocab_sizes]
+        self.code_len = len(self.vocab_sizes)
+        self.max_seq_len = int(max_seq_len)
+        self.max_history_len = int(max_history_len)
+        self.hidden_size = int(hidden_size)
+        self.depth = int(depth)
+        self.num_heads = int(num_heads)
+        self.num_special_tokens = int(num_special_tokens)
+        self.pad_token_id = int(pad_token_id)
+        self.mask_token_id = int(mask_token_id)
+        self.latent_dim = int(latent_dim)
+        self.prediction_type = str(prediction_type)
+        if self.prediction_type not in {"epsilon", "sample"}:
+            raise ValueError(f"Unsupported prediction_type={self.prediction_type}. Use `epsilon` or `sample`.")
+        if self.latent_dim % self.code_len != 0:
+            raise ValueError(
+                f"latent_dim={self.latent_dim} must be divisible by code_len={self.code_len}."
+            )
+        self.latent_slot_dim = self.latent_dim // self.code_len
+
+        self.token_embed = nn.Embedding(
+            self.vocab_size,
+            self.hidden_size,
+            padding_idx=self.pad_token_id,
+        )
+        self.position_embed = nn.Embedding(self.max_seq_len, self.hidden_size)
+        self.slot_embed = nn.Embedding(self.max_history_len + 2, self.hidden_size)
+        self.codebook_embed = nn.Embedding(self.code_len + 2, self.hidden_size)
+        self.embed_dropout = nn.Dropout(dropout)
+        self.input_norm = RmsNorm(self.hidden_size, eps=1e-6)
+
+        self.target_latent_in = nn.Linear(self.latent_slot_dim, self.hidden_size)
+        self.target_latent_out = nn.Linear(self.hidden_size, self.latent_slot_dim)
+        self.target_slot_embed = nn.Embedding(self.code_len, self.hidden_size)
+        self.timestep_embedder = TimestepEmbedder(self.hidden_size, dtype=torch.float32)
+        self.timestep_proj = nn.Linear(self.hidden_size, self.hidden_size)
+
+        self.blocks = nn.ModuleList(
+            [GenRecDiTBlock(self.hidden_size, self.num_heads, dropout=dropout) for _ in range(self.depth)]
+        )
+        self.final_norm = RmsNorm(self.hidden_size, eps=1e-6)
+
+        self.text_condition_projector = None
+        if text_cond_dim is not None:
+            self.text_condition_projector = ConditionBranchProjector(
+                input_dim=int(text_cond_dim),
+                hidden_size=self.hidden_size,
+                max_history_len=self.max_history_len,
+                use_history=use_text_history,
+                use_pooled=use_text_pooled,
+                use_target=use_text_target,
+                dropout=dropout,
+            )
+
+        self.image_condition_projector = None
+        if image_cond_dim is not None:
+            self.image_condition_projector = ConditionBranchProjector(
+                input_dim=int(image_cond_dim),
+                hidden_size=self.hidden_size,
+                max_history_len=self.max_history_len,
+                use_history=use_image_history,
+                use_pooled=use_image_pooled,
+                use_target=use_image_target,
+                dropout=dropout,
+            )
+
+        self.cf_condition_projector = None
+        if cf_cond_dim is not None:
+            self.cf_condition_projector = ConditionBranchProjector(
+                input_dim=int(cf_cond_dim),
+                hidden_size=self.hidden_size,
+                max_history_len=self.max_history_len,
+                use_history=use_cf_history,
+                use_pooled=use_cf_pooled,
+                use_target=use_cf_target,
+                dropout=dropout,
+            )
+
+        self.noise_scheduler = DDPMScheduler(
+            num_train_timesteps=int(num_train_timesteps),
+            beta_schedule=beta_schedule,
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.token_embed.weight, std=0.02)
+        if self.pad_token_id >= 0:
+            with torch.no_grad():
+                self.token_embed.weight[self.pad_token_id].zero_()
+        nn.init.normal_(self.position_embed.weight, std=0.02)
+        nn.init.normal_(self.slot_embed.weight, std=0.02)
+        nn.init.normal_(self.codebook_embed.weight, std=0.02)
+        nn.init.normal_(self.target_slot_embed.weight, std=0.02)
+        nn.init.xavier_uniform_(self.target_latent_in.weight)
+        nn.init.zeros_(self.target_latent_in.bias)
+        nn.init.xavier_uniform_(self.target_latent_out.weight)
+        nn.init.zeros_(self.target_latent_out.bias)
+        nn.init.xavier_uniform_(self.timestep_proj.weight)
+        nn.init.zeros_(self.timestep_proj.bias)
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                if module in {
+                    self.target_latent_in,
+                    self.target_latent_out,
+                    self.timestep_proj,
+                }:
+                    continue
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    @classmethod
+    def from_batch_metadata(
+        cls,
+        *,
+        manifest: dict,
+        max_history_len: int,
+        latent_dim: int,
+        prediction_type: str,
+        num_train_timesteps: int,
+        beta_schedule: str,
+        hidden_size: int,
+        depth: int,
+        num_heads: int,
+        text_cond_dim: int | None = None,
+        image_cond_dim: int | None = None,
+        cf_cond_dim: int | None = None,
+        use_text_history: bool = True,
+        use_text_pooled: bool = True,
+        use_text_target: bool = False,
+        use_image_history: bool = True,
+        use_image_pooled: bool = True,
+        use_image_target: bool = False,
+        use_cf_history: bool = True,
+        use_cf_pooled: bool = True,
+        use_cf_target: bool = False,
+        dropout: float = 0.0,
+    ) -> "GenRecHybridDiffusionRunner":
+        special_tokens = manifest.get("special_tokens", {})
+        max_seq_len = max(
+            int(split_info["max_seq_len"])
+            for split_info in manifest.get("splits", {}).values()
+        )
+        return cls(
+            vocab_size=int(manifest["vocab_size"]),
+            vocab_sizes=[int(value) for value in manifest["vocab_sizes"]],
+            max_seq_len=max_seq_len,
+            max_history_len=max_history_len,
+            latent_dim=latent_dim,
+            prediction_type=prediction_type,
+            num_train_timesteps=num_train_timesteps,
+            beta_schedule=beta_schedule,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            num_special_tokens=len(special_tokens) or 5,
+            pad_token_id=int(special_tokens.get("pad_token_id", 0)),
+            mask_token_id=int(special_tokens.get("mask_token_id", 1)),
+            text_cond_dim=text_cond_dim,
+            image_cond_dim=image_cond_dim,
+            cf_cond_dim=cf_cond_dim,
+            use_text_history=use_text_history,
+            use_text_pooled=use_text_pooled,
+            use_text_target=use_text_target,
+            use_image_history=use_image_history,
+            use_image_pooled=use_image_pooled,
+            use_image_target=use_image_target,
+            use_cf_history=use_cf_history,
+            use_cf_pooled=use_cf_pooled,
+            use_cf_target=use_cf_target,
+            dropout=dropout,
+        )
+
+    def _project_condition_branch(
+        self,
+        projector: ConditionBranchProjector | None,
+        *,
+        history_embeds: torch.Tensor | None,
+        history_mask: torch.Tensor | None,
+        pooled_embed: torch.Tensor | None,
+        target_embed: torch.Tensor | None,
+        target_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if projector is None:
+            return None, None
+        output = projector(
+            history_embeds=history_embeds,
+            history_mask=history_mask,
+            pooled_embed=pooled_embed,
+            target_embed=target_embed,
+            target_mask=target_mask,
+        )
+        return output.tokens, output.attention_mask
+
+    def _extract_target_positions(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor | None,
+        token_codebook_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch_size, _ = input_ids.shape
+        positions = torch.zeros(
+            (batch_size, self.code_len),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        for row_idx in range(batch_size):
+            if labels is not None:
+                row_positions = torch.nonzero(labels[row_idx] != -100, as_tuple=False).flatten()
+            else:
+                row_positions = torch.nonzero(
+                    (input_ids[row_idx] == self.mask_token_id) & attention_mask[row_idx].bool(),
+                    as_tuple=False,
+                ).flatten()
+
+            if row_positions.numel() != self.code_len:
+                raise ValueError(
+                    "Unable to locate target positions for diffusion latent slots. "
+                    f"Expected {self.code_len}, got {row_positions.numel()}."
+                )
+
+            if token_codebook_ids is not None:
+                row_codebooks = token_codebook_ids[row_idx, row_positions]
+                sort_index = torch.argsort(row_codebooks)
+                row_positions = row_positions[sort_index]
+            positions[row_idx] = row_positions
+        return positions
+
+    def _inject_noisy_target_latents(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        noisy_target_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        target_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = noisy_target_latents.shape[0]
+        latent_slots = noisy_target_latents.reshape(batch_size, self.code_len, self.latent_slot_dim)
+        latent_tokens = self.target_latent_in(latent_slots)
+
+        timestep_tokens = self.timestep_proj(self.timestep_embedder(timesteps)).unsqueeze(1)
+        slot_indices = torch.arange(
+            self.code_len,
+            device=hidden_states.device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+        latent_tokens = latent_tokens + timestep_tokens + self.target_slot_embed(slot_indices)
+        latent_tokens = latent_tokens.to(dtype=hidden_states.dtype)
+
+        batch_index = torch.arange(batch_size, device=hidden_states.device, dtype=torch.long).unsqueeze(1)
+        hidden_states[batch_index, target_positions] = hidden_states[batch_index, target_positions] + latent_tokens
+        return hidden_states
+
+    def _encode_sequence(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_slot_ids: torch.Tensor | None = None,
+        token_codebook_ids: torch.Tensor | None = None,
+        noisy_target_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = input_ids.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Input sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}."
+            )
+        if noisy_target_latents.ndim != 2 or noisy_target_latents.shape[1] != self.latent_dim:
+            raise ValueError(
+                f"`noisy_target_latents` must have shape [B, {self.latent_dim}], got {tuple(noisy_target_latents.shape)}."
+            )
+        if noisy_target_latents.shape[0] != batch_size:
+            raise ValueError(
+                "Batch size mismatch between input_ids and noisy_target_latents: "
+                f"{batch_size} vs {noisy_target_latents.shape[0]}."
+            )
+        if timesteps.ndim != 1 or timesteps.shape[0] != batch_size:
+            raise ValueError(
+                f"`timesteps` must have shape [B], got {tuple(timesteps.shape)}."
+            )
+
+        positions = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0)
+        x = self.token_embed(input_ids) + self.position_embed(positions)
+
+        if token_slot_ids is not None:
+            slot_ids = token_slot_ids.to(device=input_ids.device, dtype=torch.long) + 1
+            slot_ids = slot_ids.clamp(min=0, max=self.max_history_len + 1)
+            x = x + self.slot_embed(slot_ids)
+
+        if token_codebook_ids is not None:
+            codebook_ids = token_codebook_ids.to(device=input_ids.device, dtype=torch.long) + 1
+            codebook_ids = codebook_ids.clamp(min=0, max=self.code_len + 1)
+            x = x + self.codebook_embed(codebook_ids)
+
+        target_positions = self._extract_target_positions(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            token_codebook_ids=token_codebook_ids,
+        )
+        x = self._inject_noisy_target_latents(
+            hidden_states=x,
+            noisy_target_latents=noisy_target_latents,
+            timesteps=timesteps,
+            target_positions=target_positions,
+        )
+
+        x = self.embed_dropout(self.input_norm(x))
+        x = x * attention_mask.unsqueeze(-1).to(dtype=x.dtype)
+        return x, target_positions
+
+    def _collect_target_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        target_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        batch_index = torch.arange(batch_size, device=hidden_states.device, dtype=torch.long).unsqueeze(1)
+        return hidden_states[batch_index, target_positions]
+
+    def _predict_x0_from_epsilon(
+        self,
+        *,
+        noisy_target_latents: torch.Tensor,
+        eps_prediction: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(
+            device=noisy_target_latents.device,
+            dtype=noisy_target_latents.dtype,
+        )
+        alpha_bar = alphas_cumprod[timesteps].unsqueeze(1)
+        sqrt_alpha_bar = alpha_bar.sqrt()
+        sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+        return (noisy_target_latents - sqrt_one_minus_alpha_bar * eps_prediction) / sqrt_alpha_bar.clamp_min(1e-6)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        noisy_target_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        token_slot_ids: torch.Tensor | None = None,
+        token_codebook_ids: torch.Tensor | None = None,
+        history_masks: torch.Tensor | None = None,
+        history_mask: torch.Tensor | None = None,
+        history_text_embeds: torch.Tensor | None = None,
+        target_text_embed: torch.Tensor | None = None,
+        pooled_text_embed: torch.Tensor | None = None,
+        history_image_embeds: torch.Tensor | None = None,
+        target_image_embed: torch.Tensor | None = None,
+        pooled_image_embed: torch.Tensor | None = None,
+        history_cf_embeds: torch.Tensor | None = None,
+        target_cf_embed: torch.Tensor | None = None,
+        pooled_cf_embed: torch.Tensor | None = None,
+        **_: dict,
+    ) -> HybridDiffusionOutput:
+        history_masks = history_masks if history_masks is not None else history_mask
+        attention_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+        if history_masks is not None:
+            history_masks = history_masks.to(device=input_ids.device, dtype=torch.bool)
+
+        hidden_states, target_positions = self._encode_sequence(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_slot_ids=token_slot_ids,
+            token_codebook_ids=token_codebook_ids,
+            noisy_target_latents=noisy_target_latents,
+            timesteps=timesteps,
+            labels=labels,
+        )
+
+        text_tokens, text_mask = self._project_condition_branch(
+            self.text_condition_projector,
+            history_embeds=history_text_embeds,
+            history_mask=history_masks,
+            pooled_embed=pooled_text_embed,
+            target_embed=target_text_embed,
+        )
+        image_tokens, image_mask = self._project_condition_branch(
+            self.image_condition_projector,
+            history_embeds=history_image_embeds,
+            history_mask=history_masks,
+            pooled_embed=pooled_image_embed,
+            target_embed=target_image_embed,
+        )
+        cf_tokens, cf_mask = self._project_condition_branch(
+            self.cf_condition_projector,
+            history_embeds=history_cf_embeds,
+            history_mask=history_masks,
+            pooled_embed=pooled_cf_embed,
+            target_embed=target_cf_embed,
+        )
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                image_tokens=image_tokens,
+                image_mask=image_mask,
+                cf_tokens=cf_tokens,
+                cf_mask=cf_mask,
+            )
+
+        hidden_states = self.final_norm(hidden_states)
+        target_hidden = self._collect_target_hidden(hidden_states, target_positions)
+        prediction = self.target_latent_out(target_hidden).reshape(input_ids.shape[0], self.latent_dim)
+
+        if self.prediction_type == "epsilon":
+            denoised = self._predict_x0_from_epsilon(
+                noisy_target_latents=noisy_target_latents,
+                eps_prediction=prediction,
+                timesteps=timesteps,
+            )
+        else:
+            denoised = prediction
+
+        return HybridDiffusionOutput(
+            prediction=prediction,
+            denoised_latents=denoised,
+            target_positions=target_positions,
+            hidden_states=hidden_states,
+        )
+
+    def compute_losses(
+        self,
+        *,
+        output: HybridDiffusionOutput,
+        target_latents: torch.Tensor,
+        noise: torch.Tensor,
+        diffusion_loss_weight: float = 1.0,
+        ranking_loss_weight: float = 0.0,
+        ranking_temperature: float = 0.07,
+        target_item_ids: torch.Tensor | None = None,
+        item_embedding_table: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        diffusion_target = noise if self.prediction_type == "epsilon" else target_latents
+        diffusion_loss = F.mse_loss(output.prediction.float(), diffusion_target.float())
+        total_loss = diffusion_loss * float(diffusion_loss_weight)
+
+        ranking_loss = None
+        if (
+            float(ranking_loss_weight) > 0
+            and target_item_ids is not None
+            and item_embedding_table is not None
+        ):
+            pred_query = F.normalize(output.denoised_latents.float(), dim=-1)
+            item_table = F.normalize(item_embedding_table.float(), dim=-1)
+            logits = pred_query @ item_table.t()
+            logits = logits / max(float(ranking_temperature), 1e-6)
+            ranking_loss = F.cross_entropy(
+                logits,
+                target_item_ids.to(device=pred_query.device, dtype=torch.long),
+            )
+            total_loss = total_loss + ranking_loss * float(ranking_loss_weight)
+
+        payload = {
+            "loss": total_loss,
+            "diffusion_loss": diffusion_loss,
+        }
+        if ranking_loss is not None:
+            payload["ranking_loss"] = ranking_loss
+        return payload
+
+    def prepare_training_inputs(
+        self,
+        *,
+        target_latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = target_latents.shape[0]
+        device = target_latents.device
+        noise = torch.randn_like(target_latents)
+        timesteps = torch.randint(
+            0,
+            int(self.noise_scheduler.config.num_train_timesteps),
+            (batch_size,),
+            device=device,
+            dtype=torch.long,
+        )
+        noisy_target_latents = self.noise_scheduler.add_noise(target_latents, noise, timesteps)
+        return noisy_target_latents, noise, timesteps
+
+    @torch.no_grad()
+    def sample_latents(
+        self,
+        batch: SemanticIdBatch | dict[str, torch.Tensor],
+        *,
+        num_inference_steps: int = 50,
+    ) -> torch.Tensor:
+        if isinstance(batch, dict):
+            batch = SemanticIdBatch.from_dict(batch)
+
+        device = self.token_embed.weight.device
+        dtype = self.token_embed.weight.dtype
+        batch_size = int(batch.input_ids.shape[0])
+        x_t = torch.randn(batch_size, self.latent_dim, device=device, dtype=dtype)
+
+        ddim_scheduler = DDIMScheduler(
+            num_train_timesteps=int(self.noise_scheduler.config.num_train_timesteps),
+            beta_schedule=str(self.noise_scheduler.config.beta_schedule),
+            prediction_type=self.prediction_type,
+            clip_sample=False,
+        )
+        ddim_scheduler.set_timesteps(int(num_inference_steps))
+
+        for t in ddim_scheduler.timesteps:
+            timesteps = torch.full(
+                (batch_size,),
+                int(t),
+                device=device,
+                dtype=torch.long,
+            )
+            output = self.forward(
+                input_ids=batch.input_ids,
+                attention_mask=batch.attention_mask,
+                labels=batch.labels,
+                token_slot_ids=batch.token_slot_ids,
+                token_codebook_ids=batch.token_codebook_ids,
+                history_masks=batch.history_masks,
+                history_text_embeds=batch.history_text_embeds,
+                target_text_embed=batch.target_text_embed,
+                pooled_text_embed=batch.pooled_text_embed,
+                history_image_embeds=batch.history_image_embeds,
+                target_image_embed=batch.target_image_embed,
+                pooled_image_embed=batch.pooled_image_embed,
+                history_cf_embeds=batch.history_cf_embeds,
+                target_cf_embed=batch.target_cf_embed,
+                pooled_cf_embed=batch.pooled_cf_embed,
+                noisy_target_latents=x_t,
+                timesteps=timesteps,
+            )
+            x_t = ddim_scheduler.step(output.prediction, t, x_t).prev_sample.to(dtype=dtype)
+
+        return x_t

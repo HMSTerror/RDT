@@ -111,6 +111,15 @@ def parse_args():
         help="Exclude history items from the candidate pool. Disabled by default because the target can repeat.",
     )
     parser.add_argument(
+        "--oracle_target_image",
+        action="store_true",
+        help=(
+            "Condition retrieval on the ground-truth target image during sampling. "
+            "This is an oracle diagnostic that leaks target information and must "
+            "not be used as a fair recommendation metric."
+        ),
+    )
+    parser.add_argument(
         "--mixed_precision",
         type=str,
         default="bf16",
@@ -237,6 +246,27 @@ def build_vision_encoder(vision_tower_name: str, config: dict):
     return SiglipVisionTower(vision_tower=vision_tower_name, args=None)
 
 
+def load_item_latent_init_from_buffer(config: dict) -> torch.Tensor | None:
+    buffer_root = _resolve_optional_path(
+        config.get("dataset", {}).get("buffer_root")
+        or config.get("dataset", {}).get("preprocessed_buffer_root")
+    )
+    if buffer_root is None:
+        return None
+
+    item_embeddings_path = buffer_root / "item_embeddings.npy"
+    if not item_embeddings_path.exists():
+        return None
+
+    item_embeddings = np.load(item_embeddings_path, mmap_mode="r")
+    if item_embeddings.ndim != 2 or item_embeddings.shape[1] != 128:
+        raise ValueError(
+            "Expected buffer `item_embeddings.npy` with shape [num_items, 128], "
+            f"got {tuple(item_embeddings.shape)}."
+        )
+    return torch.from_numpy(np.asarray(item_embeddings, dtype=np.float32).copy())
+
+
 def build_model_and_dataset(args):
     config = apply_runtime_overrides(
         load_config(args.config_path),
@@ -273,11 +303,15 @@ def build_model_and_dataset(args):
         torch_dtype=weight_dtype,
     )
 
+    item_latent_init = load_item_latent_init_from_buffer(config)
+    num_items = int(item_latent_init.shape[0]) if item_latent_init is not None else None
     runner = RDTRunner(
         action_dim=config["common"]["state_dim"],
         pred_horizon=config["common"]["action_chunk_size"],
         config=config["model"],
         dtype=weight_dtype,
+        num_items=num_items,
+        item_latent_init=item_latent_init,
     ).set_condition_encoder(condition_encoder)
 
     load_checkpoint(runner, args.checkpoint)
@@ -421,12 +455,21 @@ class RetrievalMetricTracker:
         return result
 
 
-def prepare_candidate_library(dataset, device: torch.device, similarity: str):
+def prepare_candidate_library(model, dataset, device: torch.device, similarity: str):
+    if hasattr(model, "get_item_latent_table"):
+        item_table = model.get_item_latent_table(
+            normalize=(similarity == "cosine"),
+            device=device,
+            dtype=torch.float32,
+        )
+        if item_table is not None:
+            return item_table, "trainable_item_latents"
+
     item_embeddings = np.load(dataset.buffer_root / "item_embeddings.npy", mmap_mode="r")
     item_tensor = torch.from_numpy(np.asarray(item_embeddings, dtype=np.float32))
     if similarity == "cosine":
         item_tensor = F.normalize(item_tensor, dim=-1)
-    return item_tensor.to(device)
+    return item_tensor.to(device), "buffer_item_embeddings"
 
 
 def build_idx_to_item_and_meta(dataset):
@@ -481,7 +524,12 @@ def main():
     max_k = max(topk_list)
 
     config, device, weight_dtype, runner, dataset, dataloader = build_model_and_dataset(args)
-    item_library = prepare_candidate_library(dataset, device=device, similarity=args.similarity)
+    item_library, candidate_source = prepare_candidate_library(
+        runner,
+        dataset,
+        device=device,
+        similarity=args.similarity,
+    )
     idx_to_item, item_meta = build_idx_to_item_and_meta(dataset)
 
     if args.save_jsonl:
@@ -505,6 +553,9 @@ def main():
 
         history_id_embeds = batch["history_id_embeds"].to(device=device, dtype=weight_dtype)
         history_pixel_values = batch["history_pixel_values"].to(device=device, dtype=weight_dtype)
+        target_pixel_values = None
+        if args.oracle_target_image:
+            target_pixel_values = batch["target_pixel_values"].to(device=device, dtype=weight_dtype)
         target_item_ids = batch["target_item_ids"].to(device=device, dtype=torch.long)
         history_item_ids = batch["history_item_ids"].to(device=device, dtype=torch.long)
         history_masks = batch["history_masks"].to(device=device, dtype=torch.bool)
@@ -518,6 +569,7 @@ def main():
             history_id_embeds=history_id_embeds,
             history_pixel_values=history_pixel_values,
             text=batch["text"],
+            target_pixel_values=target_pixel_values,
         )
         scores = compute_scores(pred_embed, item_library=item_library, similarity=args.similarity)
 
@@ -589,8 +641,10 @@ def main():
     print("")
     print(f"evaluated_samples = {tracker.total}")
     print(f"candidate_items   = {item_library.shape[0]}")
+    print(f"candidate_source  = {candidate_source}")
     print(f"similarity        = {args.similarity}")
     print(f"topk              = {topk_list}")
+    print(f"oracle_target_image = {bool(args.oracle_target_image)}")
     if save_path is not None:
         print(f"saved_predictions = {save_path}")
 

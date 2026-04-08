@@ -93,7 +93,7 @@ def _warn_once(dataset, attr_name, logger, message):
     setattr(dataset, attr_name, True)
 
 
-def _build_retrieval_eval_context(args, dataloader, device, logger):
+def _build_retrieval_eval_context(args, dataloader, device, logger, model=None):
     topk_list = _parse_topk(getattr(args, "sample_topk", "5,10,20"))
     if not topk_list:
         return None
@@ -125,18 +125,30 @@ def _build_retrieval_eval_context(args, dataloader, device, logger):
             "`sample_similarity` must be one of `cosine`, `dot`, or `neg_l2`."
         )
 
+    use_model_item_latents = bool(
+        model is not None
+        and hasattr(model, "get_item_latent_table")
+        and model.get_item_latent_table() is not None
+    )
     cache = getattr(dataset, "_sample_retrieval_cache", {})
-    cache_key = (str(device), similarity)
-    item_library = cache.get(cache_key)
+    cache_key = (str(device), similarity, use_model_item_latents)
+    item_library = None if use_model_item_latents else cache.get(cache_key)
 
     if item_library is None:
-        item_embeddings = np.load(buffer_root / "item_embeddings.npy", mmap_mode="r")
-        item_library = torch.from_numpy(np.asarray(item_embeddings, dtype=np.float32).copy())
-        if similarity == "cosine":
-            item_library = F.normalize(item_library, dim=-1)
-        item_library = item_library.to(device=device)
-        cache[cache_key] = item_library
-        dataset._sample_retrieval_cache = cache
+        if use_model_item_latents:
+            item_library = model.get_item_latent_table(
+                normalize=(similarity == "cosine"),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            item_embeddings = np.load(buffer_root / "item_embeddings.npy", mmap_mode="r")
+            item_library = torch.from_numpy(np.asarray(item_embeddings, dtype=np.float32).copy())
+            if similarity == "cosine":
+                item_library = F.normalize(item_library, dim=-1)
+            item_library = item_library.to(device=device)
+            cache[cache_key] = item_library
+            dataset._sample_retrieval_cache = cache
 
     _warn_once(
         dataset,
@@ -181,6 +193,7 @@ def log_sample_res(
         dataloader=dataloader,
         device=accelerator.device,
         logger=logger,
+        model=model,
     )
 
     for step, batch in enumerate(dataloader):
@@ -188,10 +201,6 @@ def log_sample_res(
             break
 
         data_indices = batch["data_indices"]
-        target_embed = batch["target_embed"].to(
-            device=accelerator.device,
-            dtype=weight_dtype,
-        )
         history_id_embeds = batch["history_id_embeds"].to(
             device=accelerator.device,
             dtype=weight_dtype,
@@ -206,6 +215,25 @@ def log_sample_res(
             history_pixel_values=history_pixel_values,
             text=batch["text"],
         )
+
+        if (
+            "target_item_ids" in batch
+            and hasattr(model, "lookup_item_latents")
+            and getattr(model, "has_trainable_item_latents", lambda: False)()
+        ):
+            target_item_ids_for_loss = batch["target_item_ids"].to(
+                device=accelerator.device,
+                dtype=torch.long,
+            )
+            target_embed = model.lookup_item_latents(
+                target_item_ids_for_loss,
+                dtype=weight_dtype,
+            ).unsqueeze(1)
+        else:
+            target_embed = batch["target_embed"].to(
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
 
         loss = F.mse_loss(pred_actions, target_embed, reduction="none").float()
         mse_loss_per_entry = loss.reshape(loss.shape[0], -1).mean(dim=1)
