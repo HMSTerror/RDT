@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers.optimization import get_scheduler
 
@@ -57,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_steps", type=int, default=None)
     parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=Path,
+        default=None,
+        help="Checkpoint directory to resume from (e.g., output_dir/checkpoint-43000).",
+    )
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -100,11 +107,13 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    sampler=None,
 ) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=GenRecTokenizedCollator(),
@@ -120,6 +129,37 @@ def resolve_training_value(cli_value, config_section: dict, key: str, default):
     if cli_value is not None:
         return cli_value
     return config_section.get(key, default)
+
+
+def load_target_frequencies_from_dataset(dataset: GenRecTokenizedDataset) -> np.ndarray:
+    target_item_ids = np.asarray(dataset.arrays["target_item_ids"], dtype=np.int64)
+    valid_target_item_ids = target_item_ids[target_item_ids >= 0]
+    return np.bincount(valid_target_item_ids, minlength=dataset.max_item_id + 1).astype(np.int64, copy=False)
+
+
+def build_inverse_frequency_weights(
+    frequencies: np.ndarray,
+    *,
+    power: float,
+    min_weight: float,
+    max_weight: float,
+    offset: float = 1.0,
+) -> np.ndarray:
+    freq = np.asarray(frequencies, dtype=np.float64)
+    weights = np.power(freq + float(offset), -float(power))
+    valid_mask = freq > 0
+    if valid_mask.any():
+        weights = weights / max(float(weights[valid_mask].mean()), 1e-12)
+    weights = np.clip(weights, float(min_weight), float(max_weight))
+    return weights.astype(np.float32, copy=False)
+
+
+def summarize_weight_vector(weights: np.ndarray) -> dict[str, float]:
+    return {
+        "min": float(np.min(weights)),
+        "mean": float(np.mean(weights)),
+        "max": float(np.max(weights)),
+    }
 
 
 def prepare_target_latents(
@@ -155,6 +195,7 @@ def evaluate(
     if dataloader is None:
         return {}
 
+    base_model = accelerator.unwrap_model(model)
     model.eval()
     diffusion_losses: list[float] = []
     ranking_losses: list[float] = []
@@ -169,16 +210,16 @@ def evaluate(
             batch=batch,
             item_latent_table=item_latent_table,
             normalize=normalize_target_latent,
-            dtype=model.token_embed.weight.dtype,
+            dtype=base_model.token_embed.weight.dtype,
         )
-        noisy_target_latents, noise, timesteps = model.prepare_training_inputs(target_latents=target_latents)
+        noisy_target_latents, noise, timesteps = base_model.prepare_training_inputs(target_latents=target_latents)
 
         outputs = model(
             **batch,
             noisy_target_latents=noisy_target_latents,
             timesteps=timesteps,
         )
-        loss_dict = model.compute_losses(
+        loss_dict = base_model.compute_losses(
             output=outputs,
             target_latents=target_latents,
             noise=noise,
@@ -211,6 +252,8 @@ def save_checkpoint(
     *,
     accelerator: Accelerator,
     model: GenRecHybridDiffusionRunner,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
     output_dir: Path,
     step: int,
     run_manifest: dict,
@@ -223,10 +266,82 @@ def save_checkpoint(
     checkpoint_dir = output_dir / f"checkpoint-{step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    state_dict = accelerator.unwrap_model(model).state_dict()
-    torch.save(state_dict, checkpoint_dir / "pytorch_model.bin")
+    model_state_dict = accelerator.unwrap_model(model).state_dict()
+    torch.save(model_state_dict, checkpoint_dir / "pytorch_model.bin")
+    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    torch.save(lr_scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+    with open(checkpoint_dir / "training_state.json", "w", encoding="utf-8") as fp:
+        json.dump({"global_step": int(step)}, fp, indent=2, ensure_ascii=False)
     with open(checkpoint_dir / "run_manifest.json", "w", encoding="utf-8") as fp:
         json.dump(run_manifest, fp, indent=2, ensure_ascii=False)
+
+
+def infer_step_from_checkpoint_dir(path: Path) -> int | None:
+    match = re.search(r"checkpoint-(\d+)", path.name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def resume_from_checkpoint(
+    *,
+    accelerator: Accelerator,
+    model: GenRecHybridDiffusionRunner,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
+    checkpoint_dir: Path,
+) -> int:
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+
+    model_path = checkpoint_dir / "pytorch_model.bin"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    maybe_print(accelerator, f"[resume] loading model from {model_path}")
+    model_state = torch.load(model_path, map_location="cpu")
+    accelerator.unwrap_model(model).load_state_dict(model_state, strict=True)
+
+    step = None
+    training_state_path = checkpoint_dir / "training_state.json"
+    if training_state_path.exists():
+        with open(training_state_path, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+        step = int(payload.get("global_step", 0))
+    if step is None:
+        step = infer_step_from_checkpoint_dir(checkpoint_dir)
+    if step is None:
+        step = 0
+
+    optimizer_path = checkpoint_dir / "optimizer.pt"
+    if optimizer_path.exists():
+        maybe_print(accelerator, f"[resume] loading optimizer state from {optimizer_path}")
+        optimizer_state = torch.load(optimizer_path, map_location="cpu")
+        optimizer.load_state_dict(optimizer_state)
+    else:
+        maybe_print(
+            accelerator,
+            f"[resume] optimizer state missing at {optimizer_path}; optimizer will be reset.",
+        )
+
+    scheduler_path = checkpoint_dir / "scheduler.pt"
+    if scheduler_path.exists():
+        maybe_print(accelerator, f"[resume] loading scheduler state from {scheduler_path}")
+        scheduler_state = torch.load(scheduler_path, map_location="cpu")
+        lr_scheduler.load_state_dict(scheduler_state)
+    else:
+        maybe_print(
+            accelerator,
+            f"[resume] scheduler state missing at {scheduler_path}; trying to fast-forward scheduler to step={step}.",
+        )
+        if step > 0:
+            try:
+                lr_scheduler.step(step)
+            except TypeError:
+                for _ in range(step):
+                    lr_scheduler.step()
+    maybe_print(accelerator, f"[resume] restored global_step={step}")
+    return step
 
 
 def main() -> None:
@@ -308,12 +423,53 @@ def main() -> None:
     diffusion_loss_weight = float(training_cfg.get("diffusion_loss_weight", 1.0))
     ranking_loss_weight = float(training_cfg.get("ranking_loss_weight", 0.0))
     ranking_temperature = float(training_cfg.get("ranking_temperature", 0.07))
+    tail_sampler_cfg = training_cfg.get("tail_sampler", {})
+    tail_sampler_enabled = bool(tail_sampler_cfg.get("enabled", False))
+    tail_sampler_power = float(tail_sampler_cfg.get("power", 0.5))
+    tail_sampler_min_weight = float(tail_sampler_cfg.get("min_weight", 0.25))
+    tail_sampler_max_weight = float(tail_sampler_cfg.get("max_weight", 4.0))
+    ranking_reweight_cfg = training_cfg.get("ranking_reweight", {})
+    ranking_reweight_enabled = bool(ranking_reweight_cfg.get("enabled", False))
+    ranking_reweight_power = float(ranking_reweight_cfg.get("power", 0.5))
+    ranking_reweight_min_weight = float(ranking_reweight_cfg.get("min_weight", 0.5))
+    ranking_reweight_max_weight = float(ranking_reweight_cfg.get("max_weight", 3.0))
+
+    train_item_frequencies = load_target_frequencies_from_dataset(train_dataset)
+    train_item_weights = build_inverse_frequency_weights(
+        train_item_frequencies,
+        power=ranking_reweight_power,
+        min_weight=ranking_reweight_min_weight,
+        max_weight=ranking_reweight_max_weight,
+    )
+    ranking_item_weights = None
+    if ranking_reweight_enabled and ranking_loss_weight > 0:
+        ranking_item_weights = torch.from_numpy(train_item_weights.copy())
+
+    train_sampler = None
+    tail_sample_weights_summary = None
+    if tail_sampler_enabled:
+        tail_sampler_item_weights = build_inverse_frequency_weights(
+            train_item_frequencies,
+            power=tail_sampler_power,
+            min_weight=tail_sampler_min_weight,
+            max_weight=tail_sampler_max_weight,
+        )
+        train_target_item_ids = np.asarray(train_dataset.arrays["target_item_ids"], dtype=np.int64)
+        sample_weights = tail_sampler_item_weights[train_target_item_ids]
+        tail_sample_weights_summary = summarize_weight_vector(sample_weights)
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=int(sample_weights.shape[0]),
+            replacement=True,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
 
     train_loader = make_dataloader(
         train_dataset,
         batch_size=train_batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
         num_workers=args.num_workers,
+        sampler=train_sampler,
     )
     valid_loader = None
     if valid_dataset is not None:
@@ -361,6 +517,22 @@ def main() -> None:
         weight_decay=weight_decay,
     )
 
+    if valid_loader is None:
+        model, optimizer, train_loader = accelerator.prepare(
+            model,
+            optimizer,
+            train_loader,
+        )
+    else:
+        model, optimizer, train_loader, valid_loader = accelerator.prepare(
+            model,
+            optimizer,
+            train_loader,
+            valid_loader,
+        )
+
+    # Important: compute effective steps after `accelerator.prepare(...)`,
+    # because distributed dataloader length may differ from the raw loader.
     num_update_steps_per_epoch = max(1, math.ceil(len(train_loader)))
     if max_train_steps is None:
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
@@ -375,28 +547,16 @@ def main() -> None:
         num_training_steps=max_train_steps,
     )
 
-    if valid_loader is None:
-        model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
-            model,
-            optimizer,
-            train_loader,
-            lr_scheduler,
-        )
-    else:
-        model, optimizer, train_loader, valid_loader, lr_scheduler = accelerator.prepare(
-            model,
-            optimizer,
-            train_loader,
-            valid_loader,
-            lr_scheduler,
-        )
-
     item_latent_table = item_latent_table.to(device=accelerator.device, dtype=torch.float32)
+    if ranking_item_weights is not None:
+        ranking_item_weights = ranking_item_weights.to(device=accelerator.device, dtype=torch.float32)
+    base_model = accelerator.unwrap_model(model)
 
     run_manifest = {
         "experiment_name": experiment_name,
         "config_path": str(args.config_path),
         "output_dir": str(output_dir),
+        "resume_from_checkpoint": str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None,
         "tokenized_root": str(tokenized_root),
         "train_split": train_split,
         "valid_split": valid_split if valid_dataset is not None else None,
@@ -419,40 +579,75 @@ def main() -> None:
         "image_cond_dim": image_cond_dim,
         "cf_cond_dim": cf_cond_dim,
         "mixed_precision": args.mixed_precision,
-        "prediction_type": model.prediction_type,
-        "num_train_timesteps": int(model.noise_scheduler.config.num_train_timesteps),
-        "beta_schedule": str(model.noise_scheduler.config.beta_schedule),
+        "prediction_type": base_model.prediction_type,
+        "num_train_timesteps": int(base_model.noise_scheduler.config.num_train_timesteps),
+        "beta_schedule": str(base_model.noise_scheduler.config.beta_schedule),
         "diffusion_loss_weight": diffusion_loss_weight,
         "ranking_loss_weight": ranking_loss_weight,
         "ranking_temperature": ranking_temperature,
+        "tail_sampler": {
+            "enabled": tail_sampler_enabled,
+            "power": tail_sampler_power,
+            "min_weight": tail_sampler_min_weight,
+            "max_weight": tail_sampler_max_weight,
+            "sample_weight_summary": tail_sample_weights_summary,
+        },
+        "ranking_reweight": {
+            "enabled": ranking_reweight_enabled and ranking_loss_weight > 0,
+            "power": ranking_reweight_power,
+            "min_weight": ranking_reweight_min_weight,
+            "max_weight": ranking_reweight_max_weight,
+            "item_weight_summary": summarize_weight_vector(train_item_weights),
+        },
     }
 
     maybe_print(accelerator, "========== Hybrid GenRec Diffusion Training ==========")
     maybe_print(accelerator, json.dumps(run_manifest, indent=2, ensure_ascii=False))
 
     global_step = 0
+    if args.resume_from_checkpoint is not None:
+        global_step = resume_from_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            checkpoint_dir=args.resume_from_checkpoint,
+        )
+
     progress_bar = tqdm(
-        range(max_train_steps),
+        total=max_train_steps,
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Hybrid Train",
     )
 
+    if global_step >= max_train_steps:
+        maybe_print(
+            accelerator,
+            f"[resume] global_step ({global_step}) already reached max_train_steps ({max_train_steps}), skipping training loop.",
+        )
+
     for _ in range(num_train_epochs):
         model.train()
         for batch in train_loader:
+            if global_step >= max_train_steps:
+                break
+
             target_latents = prepare_target_latents(
                 batch=batch,
                 item_latent_table=item_latent_table,
                 normalize=normalize_target_latent,
-                dtype=model.token_embed.weight.dtype,
+                dtype=base_model.token_embed.weight.dtype,
             )
-            noisy_target_latents, noise, timesteps = model.prepare_training_inputs(target_latents=target_latents)
+            noisy_target_latents, noise, timesteps = base_model.prepare_training_inputs(
+                target_latents=target_latents
+            )
             outputs = model(
                 **batch,
                 noisy_target_latents=noisy_target_latents,
                 timesteps=timesteps,
             )
-            loss_dict = model.compute_losses(
+            loss_dict = base_model.compute_losses(
                 output=outputs,
                 target_latents=target_latents,
                 noise=noise,
@@ -461,6 +656,11 @@ def main() -> None:
                 ranking_temperature=ranking_temperature,
                 target_item_ids=batch.get("target_item_ids"),
                 item_embedding_table=item_latent_table,
+                ranking_sample_weights=(
+                    ranking_item_weights[batch["target_item_ids"]]
+                    if ranking_item_weights is not None
+                    else None
+                ),
             )
             loss = loss_dict["loss"]
 
@@ -515,6 +715,8 @@ def main() -> None:
                 save_checkpoint(
                     accelerator=accelerator,
                     model=model,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
                     output_dir=output_dir,
                     step=global_step,
                     run_manifest=run_manifest,

@@ -512,6 +512,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
         ranking_temperature: float = 0.07,
         target_item_ids: torch.Tensor | None = None,
         item_embedding_table: torch.Tensor | None = None,
+        ranking_sample_weights: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         diffusion_target = noise if self.prediction_type == "epsilon" else target_latents
         diffusion_loss = F.mse_loss(output.prediction.float(), diffusion_target.float())
@@ -527,10 +528,21 @@ class GenRecHybridDiffusionRunner(nn.Module):
             item_table = F.normalize(item_embedding_table.float(), dim=-1)
             logits = pred_query @ item_table.t()
             logits = logits / max(float(ranking_temperature), 1e-6)
-            ranking_loss = F.cross_entropy(
+            per_sample_ranking_loss = F.cross_entropy(
                 logits,
                 target_item_ids.to(device=pred_query.device, dtype=torch.long),
+                reduction="none",
             )
+            if ranking_sample_weights is not None:
+                sample_weights = ranking_sample_weights.to(
+                    device=per_sample_ranking_loss.device,
+                    dtype=per_sample_ranking_loss.dtype,
+                )
+                ranking_loss = (
+                    per_sample_ranking_loss * sample_weights
+                ).sum() / sample_weights.sum().clamp_min(1e-6)
+            else:
+                ranking_loss = per_sample_ranking_loss.mean()
             total_loss = total_loss + ranking_loss * float(ranking_loss_weight)
 
         payload = {

@@ -1,240 +1,73 @@
-# RecSys-DiT
+# GenRec Hybrid Diffusion
 
-This repository is now a recommendation-only diffusion project. The original robotics data pipelines, evaluation tools, and TensorFlow preprocessing stack have been removed from the active path.
+This repository now centers on a GenRec-style recommendation pipeline:
 
-The active scope is:
+- raw Amazon review data
+- text / image / CF item embeddings
+- optional multimodal fusion
+- semantic ID quantization and tokenized train/val/test samples
+- hybrid diffusion training over continuous target latents
+- grouped retrieval evaluation on hot / mid / cold items
 
-- multimodal sequence recommendation
-- diffusion over continuous 128-d item embeddings
-- Amazon-style offline preprocessing into lightweight chunk buffers
-- training-time sampling with `NDCG@K`, `Hit@K`, and `MRR@K`
+The active code path is built around:
 
-## Recsys-Only Layout
-
-```text
-configs/
-  recsys_amazon.yaml
-  recsys_amazon_smoke.yaml
-models/
-  multimodal_encoder/
-  rdt/
-  rdt_runner.py
-scripts/
-  download_amazon_music_dataset.sh
-  generate_amazon_item_embeddings.sh
-  train_recsys_minimal.sh
-  train_recsys_server.sh
-train/
-  dataset.py
-  sample.py
-  train.py
-main.py
-preprocess_amazon.py
-retrieve_topk.py
-test_overfit.py
-```
+- [preprocess_amazon.py](/e:/RoboticsDiffusionTransformer/preprocess_amazon.py)
+- [genrec/](/e:/RoboticsDiffusionTransformer/genrec)
+- [scripts/prepare_genrec_semantic_ids.sh](/e:/RoboticsDiffusionTransformer/scripts/prepare_genrec_semantic_ids.sh)
+- [scripts/train_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_hybrid_diffusion.py)
+- [scripts/eval_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_hybrid_diffusion.py)
 
 ## Install
 
-`requirements.txt` is now runtime-only for RecSys-DiT, and `requirements_data.txt` is preprocessing-only.
-
 ```bash
-# install torch / torchvision separately for your CUDA version first
+# install torch / torchvision for your CUDA version first
 pip install -r requirements.txt
 pip install -r requirements_data.txt
 ```
 
-## Download Raw Data
+## End-to-End Flow
 
-The raw Amazon Musical Instruments files are intentionally not tracked by Git.
-
-Download them into `data/Amazon_Music_And_Instruments` with:
+1. Download the raw Amazon Musical Instruments data:
 
 ```bash
 bash scripts/download_amazon_music_dataset.sh
 ```
 
-This script creates:
-
-- `data/Amazon_Music_And_Instruments/Musical_Instruments_5.json`
-- `data/Amazon_Music_And_Instruments/meta_Musical_Instruments.json`
-
-To generate metadata-based semantic item embeddings aligned with the buffer:
+2. Build multimodal dense item embeddings, semantic IDs, and tokenized splits:
 
 ```bash
-TEXT_MODEL_NAME_OR_PATH=/path/to/local_t5_or_hf_id \
-bash scripts/generate_amazon_item_embeddings.sh
+TEXT_MODEL_NAME_OR_PATH=/path/to/t5 \
+VISION_MODEL_NAME_OR_PATH=/path/to/siglip \
+bash scripts/prepare_genrec_semantic_ids.sh
 ```
 
-This creates:
-
-- `data/Amazon_Music_And_Instruments/item_embeddings.npy`
-- `data/Amazon_Music_And_Instruments/item_embeddings.meta.json`
-
-If you want to override the target folder:
+3. Train the hybrid diffusion model:
 
 ```bash
-DATA_ROOT=data/Amazon_Music_And_Instruments \
-bash scripts/download_amazon_music_dataset.sh
+bash scripts/run_genrec_hybrid_diffusion_train50k_clean.sh
 ```
 
-## Current Pipeline
-
-1. `scripts/download_amazon_music_dataset.sh`
-2. `preprocess_amazon.py`
-3. `train/dataset.py`
-4. `models/multimodal_encoder/condition_encoder.py`
-5. `models/rdt/model.py`
-6. `models/rdt/blocks.py`
-7. `models/rdt_runner.py`
-8. `train/train.py`
-9. `train/sample.py`
-10. `retrieve_topk.py`
-
-## Buffer Format
-
-The preferred training input is the lightweight recommendation buffer produced by `preprocess_amazon.py`.
-
-With the default `--split-mode leave_last_two`, preprocessing writes a split root:
-
-```text
-buffer/amazon_music/
-  split_manifest.json
-  train/
-    item_embeddings.npy
-    item_meta.json
-    item_map.json
-    user_map.json
-    stats.json
-    chunk_k/samples.npz
-    chunk_k/dirty_bit
-  val/
-    ...
-  test/
-    ...
-```
-
-Each split buffer contains:
-
-- `item_embeddings.npy`
-- `item_meta.json`
-- `item_map.json`
-- `user_map.json`
-- `stats.json`
-- `chunk_k/samples.npz`
-- `chunk_k/dirty_bit`
-
-Each stored sample keeps only lightweight IDs and masks. Image tensors and item embeddings are reconstructed dynamically at training time from the global item store.
-
-Default split policy:
-
-- `train`: every user's targets except the last two
-- `val`: every user's second-to-last target
-- `test`: every user's last target
-
-If `item_embeddings.npy` is absent, preprocessing falls back to dummy random vectors for smoke testing. For meaningful recommendation training, generate real metadata-based embeddings first with `scripts/generate_amazon_item_embeddings.sh`.
-
-## Minimal Smoke Run
-
-The quickest fully offline path uses dummy encoders plus the local `.tmp_amazon_light` buffer:
+4. Evaluate on the grouped test split:
 
 ```bash
-bash scripts/train_recsys_minimal.sh
+bash scripts/run_genrec_hybrid_diffusion_eval.sh
 ```
 
-Equivalent direct command:
+## Main Outputs
 
-```bash
-python main.py \
-  --config_path configs/recsys_amazon_smoke.yaml \
-  --pretrained_text_encoder_name_or_path dummy \
-  --pretrained_vision_encoder_name_or_path dummy \
-  --output_dir checkpoints/recsys_smoke \
-  --train_batch_size 2 \
-  --sample_batch_size 2 \
-  --max_train_steps 2 \
-  --sample_period 1 \
-  --num_sample_batches 1 \
-  --sample_topk 5,10 \
-  --sample_exclude_history_items \
-  --report_to none
-```
+- dense embeddings:
+  `item_embeddings_text.npy`, `item_embeddings_image.npy`, `item_embeddings_cf.npy`, `item_embeddings_fused.npy`
+- semantic IDs:
+  `data/Amazon_Music_And_Instruments/semantic_ids_pq/`
+- tokenized train/val/test splits:
+  `data/Amazon_Music_And_Instruments/tokenized_semantic_ids/`
+- hybrid diffusion checkpoints:
+  `checkpoints/genrec_hybrid_diffusion_amazon_50k/`
+- grouped evaluation artifacts:
+  `logs/genrec_hybrid_*`
 
-## Server Training
+## Notes
 
-完整的服务器闭环文档见：
-
-- [Recsys Server Workflow](docs/recsys_server_workflow.md)
-
-For real training on a Linux server, keep the large encoders local on disk and pass the split root at launch time instead of editing YAML by hand. If the buffer root contains `train/val/test`, training automatically uses `train/` for optimization and `val/` for in-training sampling.
-
-```bash
-TEXT_ENCODER_PATH=/models/t5-v1_1-xxl \
-VISION_ENCODER_PATH=/models/siglip-base-patch16-224 \
-BUFFER_ROOT=/data/amazon_music_buffer \
-IMAGE_ROOT=/data/images \
-OUTPUT_DIR=/exp/recsys_dit \
-bash scripts/train_recsys_server.sh
-```
-
-Equivalent direct launch command:
-
-```bash
-accelerate launch \
-  --num_processes 8 \
-  --mixed_precision bf16 \
-  main.py \
-  --config_path configs/recsys_amazon.yaml \
-  --buffer_root /data/amazon_music_buffer \
-  --image_root /data/images \
-  --pretrained_text_encoder_name_or_path /models/t5-v1_1-xxl \
-  --pretrained_vision_encoder_name_or_path /models/siglip-base-patch16-224 \
-  --output_dir /exp/recsys_dit \
-  --train_batch_size 8 \
-  --sample_batch_size 8 \
-  --sample_period 500 \
-  --num_sample_batches 2 \
-  --sample_topk 5,10,20 \
-  --sample_exclude_history_items
-```
-
-Important runtime notes:
-
-- `action_dim` is enforced to `128`
-- `action_chunk_size` is enforced to `1`
-- inference sampling never consumes the real target image
-- `main.py` now supports `--buffer_root`, `--sample_buffer_root`, and `--image_root` overrides
-- `main.py` now supports `--report_to none` for smoke tests
-- `main.py` now supports `dummy` text and vision encoders for offline validation
-
-## Retrieval Evaluation
-
-Run offline retrieval evaluation with:
-
-```bash
-python retrieve_topk.py \
-  --config_path configs/recsys_amazon.yaml \
-  --checkpoint /path/to/checkpoint \
-  --buffer_root /path/to/buffer \
-  --buffer_split test \
-  --image_root /path/to/images \
-  --pretrained_text_encoder_name_or_path /path/to/t5 \
-  --pretrained_vision_encoder_name_or_path /path/to/siglip \
-  --topk 5,10,20
-```
-
-This reports:
-
-- `mean_rank`
-- `hit@k`
-- `recall@k`
-- `mrr@k`
-- `ndcg@k`
-
-## Gradient Smoke Test
-
-Use the fixed dummy-batch overfit script to verify that gradients flow end to end:
-
-```bash
-python test_overfit.py --steps 50 --batch-size 2 --history-len 4 --lr 1e-4
-```
+- `preprocess_amazon.py` is still part of the active pipeline because semantic-ID preparation depends on its split-aware buffer generation.
+- The evaluation script reports both overall retrieval metrics and grouped long-tail metrics on `cold`, `mid`, and `hot` items.
+- The repository also keeps a lighter GenRec-DiT baseline under [genrec/models/genrec_dit.py](/e:/RoboticsDiffusionTransformer/genrec/models/genrec_dit.py).

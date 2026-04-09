@@ -75,6 +75,16 @@ training:
   diffusion_loss_weight: 1.0
   ranking_loss_weight: 0.1
   ranking_temperature: 0.07
+  tail_sampler:
+    enabled: true
+    power: 0.5
+    min_weight: 0.25
+    max_weight: 4.0
+  ranking_reweight:
+    enabled: true
+    power: 0.5
+    min_weight: 0.5
+    max_weight: 3.0
 
 evaluation:
   batch_size: 16
@@ -83,3 +93,5 @@ evaluation:
   exclude_history_items: true
   group_strategy: equal_items
   frequency_source_split: train
+  popularity_penalty: 0.05
+  popularity_penalty_source_split: train

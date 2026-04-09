@@ -24,11 +24,19 @@ from genrec.data import GenRecTokenizedCollator, GenRecTokenizedDataset  # noqa:
 from genrec.models import GenRecHybridDiffusionRunner  # noqa: E402
 
 
+"""
 GROUP_NAMES = ("cold", "mid", "hot")
 GROUP_NAMES_ZH = {
     "cold": "冷门",
     "mid": "一般",
     "hot": "热门",
+}
+"""
+GROUP_NAMES = ("cold", "mid", "hot")
+GROUP_NAMES_ZH = {
+    "cold": "\u51b7\u95e8",
+    "mid": "\u4e00\u822c",
+    "hot": "\u70ed\u95e8",
 }
 GROUP_PLOT_LABELS = {
     "cold": "Cold",
@@ -111,6 +119,22 @@ def parse_args() -> argparse.Namespace:
         default="train",
         choices=["train", "val", "test"],
         help="Which split supplies target-item observation frequency for popularity grouping.",
+    )
+    parser.add_argument(
+        "--popularity_penalty",
+        type=float,
+        default=None,
+        help=(
+            "Optional popularity penalty coefficient applied during retrieval reranking. "
+            "Uses normalized log(1 + frequency) from the configured source split."
+        ),
+    )
+    parser.add_argument(
+        "--popularity_penalty_source_split",
+        type=str,
+        default=None,
+        choices=["train", "val", "test"],
+        help="Which split supplies item frequencies for popularity reranking. Defaults to the config or frequency_source_split.",
     )
     parser.add_argument(
         "--save_json",
@@ -378,6 +402,14 @@ def build_popularity_groups(
     return item_group_ids, metadata
 
 
+def build_normalized_popularity_penalty(frequencies: np.ndarray) -> np.ndarray:
+    penalties = np.log1p(np.asarray(frequencies, dtype=np.float64))
+    max_value = float(np.max(penalties)) if penalties.size else 0.0
+    if max_value > 0:
+        penalties = penalties / max_value
+    return penalties.astype(np.float32, copy=False)
+
+
 def write_jsonl_records(path: Path, records: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fp:
@@ -489,6 +521,7 @@ def main() -> None:
     conditioning_cfg = config.get("conditioning", {})
     representation_cfg = config.get("representation", {})
     diffusion_cfg = config.get("diffusion", {})
+    evaluation_cfg = config.get("evaluation", {})
 
     topk_list = parse_topk(args.topk)
     max_k = max(topk_list)
@@ -591,6 +624,26 @@ def main() -> None:
         item_frequencies,
         strategy=args.group_strategy,
     )
+    popularity_penalty = float(
+        args.popularity_penalty
+        if args.popularity_penalty is not None
+        else evaluation_cfg.get("popularity_penalty", 0.0)
+    )
+    popularity_penalty_source_split = (
+        args.popularity_penalty_source_split
+        or evaluation_cfg.get("popularity_penalty_source_split")
+        or args.frequency_source_split
+    )
+    popularity_penalty_vector = None
+    if popularity_penalty > 0:
+        penalty_frequencies = load_split_target_frequencies(
+            tokenized_root=tokenized_root,
+            split=popularity_penalty_source_split,
+            num_items=item_latent_table.shape[0],
+        )
+        popularity_penalty_vector = torch.from_numpy(
+            build_normalized_popularity_penalty(penalty_frequencies)
+        ).to(device=device, dtype=torch.float32)
 
     if args.save_jsonl is not None and args.save_jsonl.exists():
         args.save_jsonl.unlink()
@@ -632,6 +685,8 @@ def main() -> None:
                 history_masks=history_masks,
                 target_item_ids=target_item_ids,
             )
+        if popularity_penalty_vector is not None:
+            scores = scores - float(popularity_penalty) * popularity_penalty_vector.unsqueeze(0)
 
         target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
         ranks = 1 + (scores > target_scores).sum(dim=1)
@@ -714,6 +769,10 @@ def main() -> None:
         "topk": topk_list,
         "exclude_history_items": bool(args.exclude_history_items),
         "num_inference_steps": int(args.num_inference_steps),
+        "popularity_penalty": float(popularity_penalty),
+        "popularity_penalty_source_split": (
+            popularity_penalty_source_split if popularity_penalty > 0 else None
+        ),
         "overall_metrics": overall_metrics,
         "grouping": {
             "reference": (
