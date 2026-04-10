@@ -283,6 +283,10 @@ def load_item_index_mapping(
     return {idx: item_id for item_id, idx in item_map.items()}
 
 
+def build_fallback_item_index_mapping(num_items: int) -> dict[int, str]:
+    return {idx: f"item_idx_{idx}" for idx in range(int(num_items))}
+
+
 class RetrievalMetricTracker:
     def __init__(self, topk_list: List[int]) -> None:
         self.topk_list = topk_list
@@ -606,13 +610,24 @@ def main() -> None:
     if normalize_target_latent:
         item_latent_table = F.normalize(item_latent_table, dim=-1)
 
-    idx_to_item = load_item_index_mapping(
-        buffer_root=buffer_root,
-        split_for_item_map=train_split,
-    )
-    if len(idx_to_item) != item_latent_table.shape[0]:
-        raise ValueError(
-            f"Item map size ({len(idx_to_item)}) does not match latent table rows ({item_latent_table.shape[0]})."
+    item_id_mapping_source = "buffer_item_map"
+    try:
+        idx_to_item = load_item_index_mapping(
+            buffer_root=buffer_root,
+            split_for_item_map=train_split,
+        )
+        if len(idx_to_item) != item_latent_table.shape[0]:
+            raise ValueError(
+                f"Item map size ({len(idx_to_item)}) does not match latent table rows ({item_latent_table.shape[0]})."
+            )
+    except (FileNotFoundError, ValueError) as exc:
+        item_id_mapping_source = "synthetic_item_idx"
+        idx_to_item = build_fallback_item_index_mapping(item_latent_table.shape[0])
+        print(f"[warn] {exc}")
+        print(
+            "[warn] Falling back to synthetic item identifiers because the buffer item_map "
+            "is unavailable or incompatible. Metrics remain valid; JSONL item_id fields "
+            "will use item_idx_<n>."
         )
 
     item_frequencies = load_split_target_frequencies(
@@ -764,6 +779,7 @@ def main() -> None:
         "tokenized_root": str(tokenized_root),
         "buffer_root": str(buffer_root),
         "target_latent_path": str(target_latent_path),
+        "item_id_mapping_source": item_id_mapping_source,
         "evaluated_samples": int(overall_tracker.total),
         "candidate_items": int(item_latent_table.shape[0]),
         "topk": topk_list,

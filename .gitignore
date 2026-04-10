@@ -173,10 +173,9 @@ outs/
 # Checkpoints
 checkpoints/
 
-# Local datasets
+# Local datasets 
 data/Amazon_Music_And_Instruments/
 data/images/
-old/
 
 # VSC
 .vscode/
