@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers.optimization import get_scheduler
@@ -398,7 +398,11 @@ def main() -> None:
     training_cfg = config.get("training", {})
 
     output_dir = args.output_dir or Path("checkpoints") / experiment_name
-    accelerator = Accelerator(mixed_precision=args.mixed_precision)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        kwargs_handlers=[ddp_kwargs],
+    )
     set_seed(args.seed)
 
     train_split = data_cfg.get("train_split", "train")
