@@ -140,6 +140,16 @@ class GenRecDiTBlock(nn.Module):
             norm_layer=RmsNorm,
         )
         self.norm5 = RmsNorm(hidden_size, eps=1e-6)
+        self.popularity_cross_attn = CrossAttention(
+            hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            qk_norm=True,
+            attn_drop=dropout,
+            proj_drop=dropout,
+            norm_layer=RmsNorm,
+        )
+        self.norm6 = RmsNorm(hidden_size, eps=1e-6)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.ffn = Mlp(
             in_features=hidden_size,
@@ -159,12 +169,15 @@ class GenRecDiTBlock(nn.Module):
         image_mask: torch.Tensor | None = None,
         cf_tokens: torch.Tensor | None = None,
         cf_mask: torch.Tensor | None = None,
+        popularity_tokens: torch.Tensor | None = None,
+        popularity_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attention_mask=attention_mask)
         x = x + self.text_cross_attn(self.norm2(x), text_tokens, text_mask)
         x = x + self.image_cross_attn(self.norm3(x), image_tokens, image_mask)
         x = x + self.cf_cross_attn(self.norm4(x), cf_tokens, cf_mask)
-        x = x + self.ffn(self.norm5(x))
+        x = x + self.popularity_cross_attn(self.norm5(x), popularity_tokens, popularity_mask)
+        x = x + self.ffn(self.norm6(x))
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1).to(dtype=x.dtype)
         return x

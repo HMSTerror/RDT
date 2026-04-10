@@ -160,6 +160,15 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Print running metrics every N batches.",
     )
+    parser.add_argument(
+        "--occlude_modalities",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated modality names to zero out at evaluation time for quick ablation, "
+            "e.g. 'text', 'image', 'cf', or 'text,image'."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -172,6 +181,24 @@ def parse_topk(topk_arg: str) -> List[int]:
     values = sorted({int(item) for item in topk_arg.split(",") if item.strip()})
     if not values or any(item <= 0 for item in values):
         raise ValueError("--topk must contain positive integers, e.g. '5,10,20'.")
+    return values
+
+
+def parse_modalities(modality_arg: str) -> List[str]:
+    if not modality_arg.strip():
+        return []
+    values = []
+    for item in modality_arg.split(","):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if name not in {"text", "image", "cf"}:
+            raise ValueError(
+                "--occlude_modalities only supports: text, image, cf "
+                f"(got {name!r})."
+            )
+        if name not in values:
+            values.append(name)
     return values
 
 
@@ -414,6 +441,51 @@ def build_normalized_popularity_penalty(frequencies: np.ndarray) -> np.ndarray:
     return penalties.astype(np.float32, copy=False)
 
 
+def build_popularity_bucket_ids(
+    frequencies: np.ndarray,
+    *,
+    num_buckets: int,
+) -> np.ndarray:
+    if num_buckets <= 1:
+        return np.zeros_like(frequencies, dtype=np.int64)
+    log_freq = np.log1p(np.asarray(frequencies, dtype=np.float64))
+    valid = log_freq[frequencies > 0]
+    if valid.size == 0:
+        return np.zeros_like(frequencies, dtype=np.int64)
+    quantiles = np.linspace(0.0, 1.0, num_buckets + 1, dtype=np.float64)[1:-1]
+    boundaries = np.quantile(valid, quantiles)
+    bucket_ids = np.digitize(log_freq, boundaries, right=True)
+    return bucket_ids.astype(np.int64, copy=False)
+
+
+def apply_modality_occlusion_inplace(batch: dict[str, torch.Tensor], modalities: List[str]) -> None:
+    if not modalities:
+        return
+
+    branch_to_keys = {
+        "text": (
+            "history_text_embeds",
+            "target_text_embed",
+            "pooled_text_embed",
+        ),
+        "image": (
+            "history_image_embeds",
+            "target_image_embed",
+            "pooled_image_embed",
+        ),
+        "cf": (
+            "history_cf_embeds",
+            "target_cf_embed",
+            "pooled_cf_embed",
+        ),
+    }
+    for modality in modalities:
+        for key in branch_to_keys[modality]:
+            value = batch.get(key)
+            if torch.is_tensor(value):
+                value.zero_()
+
+
 def write_jsonl_records(path: Path, records: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fp:
@@ -519,6 +591,7 @@ def plot_grouped_metrics(
 
 def main() -> None:
     args = parse_args()
+    occluded_modalities = parse_modalities(args.occlude_modalities)
     config = load_yaml(args.config_path)
     data_cfg = config.get("data", {})
     backbone_cfg = config.get("backbone", {})
@@ -552,6 +625,11 @@ def main() -> None:
     )
     image_embedding_path = conditioning_cfg.get("image_embedding_path") if use_image else None
     cf_embedding_path = conditioning_cfg.get("cf_embedding_path") if conditioning_cfg.get("use_cf", False) else None
+    use_popularity = bool(conditioning_cfg.get("use_popularity", False))
+    popularity_num_buckets = int(conditioning_cfg.get("popularity_num_buckets", 16))
+    popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
+    use_popularity_history = bool(conditioning_cfg.get("use_popularity_history", use_popularity))
+    use_popularity_pooled = bool(conditioning_cfg.get("use_popularity_pooled", use_popularity))
 
     dataset, dataloader = build_dataloader(
         tokenized_root=tokenized_root,
@@ -578,6 +656,20 @@ def main() -> None:
         )
     normalize_target_latent = bool(representation_cfg.get("normalize_target_latent", True))
 
+    popularity_bucket_ids = None
+    if use_popularity:
+        train_item_frequencies = load_split_target_frequencies(
+            tokenized_root=tokenized_root,
+            split=train_split,
+            num_items=item_latent_table.shape[0],
+        )
+        popularity_bucket_ids = torch.from_numpy(
+            build_popularity_bucket_ids(
+                train_item_frequencies,
+                num_buckets=popularity_num_buckets,
+            )
+        )
+
     model = GenRecHybridDiffusionRunner.from_batch_metadata(
         manifest=tokenized_manifest,
         max_history_len=history_len,
@@ -591,6 +683,9 @@ def main() -> None:
         text_cond_dim=text_cond_dim,
         image_cond_dim=image_cond_dim,
         cf_cond_dim=cf_cond_dim,
+        popularity_cond_dim=(popularity_cond_dim if use_popularity else None),
+        popularity_num_buckets=(popularity_num_buckets if use_popularity else None),
+        item_popularity_bucket_ids=popularity_bucket_ids,
         use_text_history=bool(conditioning_cfg.get("use_text_history", conditioning_cfg.get("use_text", False))),
         use_text_pooled=bool(conditioning_cfg.get("use_text_pooled", conditioning_cfg.get("use_text", False))),
         use_text_target=bool(conditioning_cfg.get("use_target_text", False)),
@@ -600,6 +695,8 @@ def main() -> None:
         use_cf_history=bool(conditioning_cfg.get("use_cf_history", conditioning_cfg.get("use_cf", False))),
         use_cf_pooled=bool(conditioning_cfg.get("use_cf_pooled", conditioning_cfg.get("use_cf", False))),
         use_cf_target=bool(conditioning_cfg.get("use_target_cf", False)),
+        use_popularity_history=use_popularity_history,
+        use_popularity_pooled=use_popularity_pooled,
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
     load_model_checkpoint(model, args.checkpoint)
@@ -680,6 +777,7 @@ def main() -> None:
             key: value.to(device) if torch.is_tensor(value) else value
             for key, value in batch.items()
         }
+        apply_modality_occlusion_inplace(batch, occluded_modalities)
         sampled_latents = model.sample_latents(
             batch,
             num_inference_steps=args.num_inference_steps,
@@ -785,6 +883,9 @@ def main() -> None:
         "topk": topk_list,
         "exclude_history_items": bool(args.exclude_history_items),
         "num_inference_steps": int(args.num_inference_steps),
+        "occluded_modalities": occluded_modalities,
+        "use_popularity": use_popularity,
+        "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
         "popularity_penalty": float(popularity_penalty),
         "popularity_penalty_source_split": (
             popularity_penalty_source_split if popularity_penalty > 0 else None

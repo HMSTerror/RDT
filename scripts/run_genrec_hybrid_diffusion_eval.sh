@@ -23,6 +23,7 @@ fi
 : "${POPULARITY_PENALTY_SOURCE_SPLIT:=}"
 : "${MAX_EVAL_BATCHES:=0}"
 : "${PRINT_EVERY:=20}"
+: "${OCCLUDE_MODALITIES:=}"
 : "${LOG_DIR:=logs}"
 
 mkdir -p "${LOG_DIR}"
@@ -72,11 +73,16 @@ if [[ -n "${POPULARITY_PENALTY_SOURCE_SPLIT}" ]]; then
   CMD+=(--popularity_penalty_source_split "${POPULARITY_PENALTY_SOURCE_SPLIT}")
 fi
 
+if [[ -n "${OCCLUDE_MODALITIES}" ]]; then
+  CMD+=(--occlude_modalities "${OCCLUDE_MODALITIES}")
+fi
+
 echo "========== Hybrid Diffusion Evaluation =========="
 echo "checkpoint: ${CHECKPOINT}"
 echo "split     : ${SPLIT}"
 echo "topk      : ${TOPK}"
 echo "pop_pen   : ${POPULARITY_PENALTY:-config-default}"
+echo "occlude   : ${OCCLUDE_MODALITIES:-none}"
 echo "save_json : ${JSON_PATH}"
 echo "save_plot : ${PLOT_PATH}"
 "${CMD[@]}" 2>&1 | tee "${LOG_DIR}/genrec_hybrid_eval_${SPLIT}_${STAMP}.log"

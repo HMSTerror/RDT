@@ -51,6 +51,9 @@ class GenRecHybridDiffusionRunner(nn.Module):
         text_cond_dim: int | None = None,
         image_cond_dim: int | None = None,
         cf_cond_dim: int | None = None,
+        popularity_cond_dim: int | None = None,
+        popularity_num_buckets: int | None = None,
+        item_popularity_bucket_ids: torch.Tensor | None = None,
         use_text_history: bool = True,
         use_text_pooled: bool = True,
         use_text_target: bool = False,
@@ -60,6 +63,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
         use_cf_history: bool = True,
         use_cf_pooled: bool = True,
         use_cf_target: bool = False,
+        use_popularity_history: bool = True,
+        use_popularity_pooled: bool = True,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -142,6 +147,41 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 dropout=dropout,
             )
 
+        self.popularity_condition_projector = None
+        self.popularity_embedding = None
+        self.popularity_padding_bucket_id: int | None = None
+        if popularity_cond_dim is not None and popularity_num_buckets is not None:
+            if item_popularity_bucket_ids is None:
+                raise ValueError(
+                    "item_popularity_bucket_ids must be provided when enabling popularity conditioning."
+                )
+            self.popularity_padding_bucket_id = int(popularity_num_buckets)
+            self.popularity_embedding = nn.Embedding(
+                int(popularity_num_buckets) + 1,
+                int(popularity_cond_dim),
+                padding_idx=self.popularity_padding_bucket_id,
+            )
+            self.popularity_condition_projector = ConditionBranchProjector(
+                input_dim=int(popularity_cond_dim),
+                hidden_size=self.hidden_size,
+                max_history_len=self.max_history_len,
+                use_history=use_popularity_history,
+                use_pooled=use_popularity_pooled,
+                use_target=False,
+                dropout=dropout,
+            )
+            self.register_buffer(
+                "item_popularity_bucket_ids",
+                item_popularity_bucket_ids.to(dtype=torch.long).clone(),
+                persistent=True,
+            )
+        else:
+            self.register_buffer(
+                "item_popularity_bucket_ids",
+                torch.empty(0, dtype=torch.long),
+                persistent=True,
+            )
+
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=int(num_train_timesteps),
             beta_schedule=beta_schedule,
@@ -195,6 +235,9 @@ class GenRecHybridDiffusionRunner(nn.Module):
         text_cond_dim: int | None = None,
         image_cond_dim: int | None = None,
         cf_cond_dim: int | None = None,
+        popularity_cond_dim: int | None = None,
+        popularity_num_buckets: int | None = None,
+        item_popularity_bucket_ids: torch.Tensor | None = None,
         use_text_history: bool = True,
         use_text_pooled: bool = True,
         use_text_target: bool = False,
@@ -204,6 +247,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
         use_cf_history: bool = True,
         use_cf_pooled: bool = True,
         use_cf_target: bool = False,
+        use_popularity_history: bool = True,
+        use_popularity_pooled: bool = True,
         dropout: float = 0.0,
     ) -> "GenRecHybridDiffusionRunner":
         special_tokens = manifest.get("special_tokens", {})
@@ -229,6 +274,9 @@ class GenRecHybridDiffusionRunner(nn.Module):
             text_cond_dim=text_cond_dim,
             image_cond_dim=image_cond_dim,
             cf_cond_dim=cf_cond_dim,
+            popularity_cond_dim=popularity_cond_dim,
+            popularity_num_buckets=popularity_num_buckets,
+            item_popularity_bucket_ids=item_popularity_bucket_ids,
             use_text_history=use_text_history,
             use_text_pooled=use_text_pooled,
             use_text_target=use_text_target,
@@ -238,8 +286,52 @@ class GenRecHybridDiffusionRunner(nn.Module):
             use_cf_history=use_cf_history,
             use_cf_pooled=use_cf_pooled,
             use_cf_target=use_cf_target,
+            use_popularity_history=use_popularity_history,
+            use_popularity_pooled=use_popularity_pooled,
             dropout=dropout,
         )
+
+    def _build_popularity_branch_inputs(
+        self,
+        *,
+        history_item_ids: torch.Tensor | None,
+        history_masks: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if (
+            self.popularity_condition_projector is None
+            or self.popularity_embedding is None
+            or self.item_popularity_bucket_ids.numel() == 0
+            or history_item_ids is None
+            or history_masks is None
+        ):
+            return None, None
+
+        history_item_ids = history_item_ids.to(dtype=torch.long)
+        history_masks = history_masks.to(dtype=torch.bool)
+        clamped_item_ids = history_item_ids.clamp(
+            min=0,
+            max=max(int(self.item_popularity_bucket_ids.shape[0]) - 1, 0),
+        )
+        history_bucket_ids = self.item_popularity_bucket_ids[clamped_item_ids]
+        if self.popularity_padding_bucket_id is None:
+            raise ValueError("popularity_padding_bucket_id is not initialized.")
+        padding_bucket_id = torch.full_like(history_bucket_ids, self.popularity_padding_bucket_id)
+        history_bucket_ids = torch.where(
+            history_masks & history_item_ids.ge(0),
+            history_bucket_ids,
+            padding_bucket_id,
+        )
+
+        history_popularity_embeds = self.popularity_embedding(history_bucket_ids)
+        valid_mask = history_masks & history_item_ids.ge(0)
+        valid_mask_f = valid_mask.unsqueeze(-1).to(dtype=history_popularity_embeds.dtype)
+        denom = valid_mask_f.sum(dim=1).clamp_min(1.0)
+        pooled_popularity_embed = (history_popularity_embeds * valid_mask_f).sum(dim=1) / denom
+        no_valid_history = ~valid_mask.any(dim=1)
+        if no_valid_history.any():
+            pooled_popularity_embed = pooled_popularity_embed.clone()
+            pooled_popularity_embed[no_valid_history] = 0
+        return history_popularity_embeds, pooled_popularity_embed
 
     def _project_condition_branch(
         self,
@@ -421,6 +513,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
         token_codebook_ids: torch.Tensor | None = None,
         history_masks: torch.Tensor | None = None,
         history_mask: torch.Tensor | None = None,
+        history_item_ids: torch.Tensor | None = None,
+        target_item_ids: torch.Tensor | None = None,
         history_text_embeds: torch.Tensor | None = None,
         target_text_embed: torch.Tensor | None = None,
         pooled_text_embed: torch.Tensor | None = None,
@@ -468,6 +562,17 @@ class GenRecHybridDiffusionRunner(nn.Module):
             pooled_embed=pooled_cf_embed,
             target_embed=target_cf_embed,
         )
+        history_popularity_embeds, pooled_popularity_embed = self._build_popularity_branch_inputs(
+            history_item_ids=history_item_ids,
+            history_masks=history_masks,
+        )
+        popularity_tokens, popularity_mask = self._project_condition_branch(
+            self.popularity_condition_projector,
+            history_embeds=history_popularity_embeds,
+            history_mask=history_masks,
+            pooled_embed=pooled_popularity_embed,
+            target_embed=None,
+        )
 
         for block in self.blocks:
             hidden_states = block(
@@ -479,6 +584,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 image_mask=image_mask,
                 cf_tokens=cf_tokens,
                 cf_mask=cf_mask,
+                popularity_tokens=popularity_tokens,
+                popularity_mask=popularity_mask,
             )
 
         hidden_states = self.final_norm(hidden_states)
@@ -605,6 +712,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 input_ids=batch.input_ids,
                 attention_mask=batch.attention_mask,
                 labels=batch.labels,
+                history_item_ids=batch.history_item_ids,
+                target_item_ids=batch.target_item_ids,
                 token_slot_ids=batch.token_slot_ids,
                 token_codebook_ids=batch.token_codebook_ids,
                 history_masks=batch.history_masks,

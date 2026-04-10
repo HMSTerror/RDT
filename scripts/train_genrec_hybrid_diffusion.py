@@ -131,10 +131,17 @@ def resolve_training_value(cli_value, config_section: dict, key: str, default):
     return config_section.get(key, default)
 
 
-def load_target_frequencies_from_dataset(dataset: GenRecTokenizedDataset) -> np.ndarray:
+def load_target_frequencies_from_dataset(
+    dataset: GenRecTokenizedDataset,
+    *,
+    min_items: int | None = None,
+) -> np.ndarray:
     target_item_ids = np.asarray(dataset.arrays["target_item_ids"], dtype=np.int64)
     valid_target_item_ids = target_item_ids[target_item_ids >= 0]
-    return np.bincount(valid_target_item_ids, minlength=dataset.max_item_id + 1).astype(np.int64, copy=False)
+    minlength = dataset.max_item_id + 1
+    if min_items is not None:
+        minlength = max(int(min_items), minlength)
+    return np.bincount(valid_target_item_ids, minlength=minlength).astype(np.int64, copy=False)
 
 
 def build_inverse_frequency_weights(
@@ -160,6 +167,23 @@ def summarize_weight_vector(weights: np.ndarray) -> dict[str, float]:
         "mean": float(np.mean(weights)),
         "max": float(np.max(weights)),
     }
+
+
+def build_popularity_bucket_ids(
+    frequencies: np.ndarray,
+    *,
+    num_buckets: int,
+) -> np.ndarray:
+    if num_buckets <= 1:
+        return np.zeros_like(frequencies, dtype=np.int64)
+    log_freq = np.log1p(np.asarray(frequencies, dtype=np.float64))
+    valid = log_freq[frequencies > 0]
+    if valid.size == 0:
+        return np.zeros_like(frequencies, dtype=np.int64)
+    quantiles = np.linspace(0.0, 1.0, num_buckets + 1, dtype=np.float64)[1:-1]
+    boundaries = np.quantile(valid, quantiles)
+    bucket_ids = np.digitize(log_freq, boundaries, right=True)
+    return bucket_ids.astype(np.int64, copy=False)
 
 
 def prepare_target_latents(
@@ -300,7 +324,14 @@ def resume_from_checkpoint(
 
     maybe_print(accelerator, f"[resume] loading model from {model_path}")
     model_state = torch.load(model_path, map_location="cpu")
-    accelerator.unwrap_model(model).load_state_dict(model_state, strict=True)
+    missing_keys, unexpected_keys = accelerator.unwrap_model(model).load_state_dict(
+        model_state,
+        strict=False,
+    )
+    if missing_keys:
+        maybe_print(accelerator, f"[resume] missing keys (first 10): {missing_keys[:10]}")
+    if unexpected_keys:
+        maybe_print(accelerator, f"[resume] unexpected keys (first 10): {unexpected_keys[:10]}")
 
     step = None
     training_state_path = checkpoint_dir / "training_state.json"
@@ -314,10 +345,19 @@ def resume_from_checkpoint(
         step = 0
 
     optimizer_path = checkpoint_dir / "optimizer.pt"
+    optimizer_restored = False
     if optimizer_path.exists():
         maybe_print(accelerator, f"[resume] loading optimizer state from {optimizer_path}")
         optimizer_state = torch.load(optimizer_path, map_location="cpu")
-        optimizer.load_state_dict(optimizer_state)
+        try:
+            optimizer.load_state_dict(optimizer_state)
+            optimizer_restored = True
+        except ValueError as exc:
+            maybe_print(
+                accelerator,
+                f"[resume] optimizer state is incompatible with the current model; "
+                f"optimizer will be reset. reason={exc}",
+            )
     else:
         maybe_print(
             accelerator,
@@ -325,14 +365,15 @@ def resume_from_checkpoint(
         )
 
     scheduler_path = checkpoint_dir / "scheduler.pt"
-    if scheduler_path.exists():
+    if scheduler_path.exists() and optimizer_restored:
         maybe_print(accelerator, f"[resume] loading scheduler state from {scheduler_path}")
         scheduler_state = torch.load(scheduler_path, map_location="cpu")
         lr_scheduler.load_state_dict(scheduler_state)
     else:
         maybe_print(
             accelerator,
-            f"[resume] scheduler state missing at {scheduler_path}; trying to fast-forward scheduler to step={step}.",
+            f"[resume] scheduler state missing/incompatible at {scheduler_path}; "
+            f"trying to fast-forward scheduler to step={step}.",
         )
         if step > 0:
             try:
@@ -433,8 +474,24 @@ def main() -> None:
     ranking_reweight_power = float(ranking_reweight_cfg.get("power", 0.5))
     ranking_reweight_min_weight = float(ranking_reweight_cfg.get("min_weight", 0.5))
     ranking_reweight_max_weight = float(ranking_reweight_cfg.get("max_weight", 3.0))
+    use_popularity = bool(conditioning_cfg.get("use_popularity", False))
+    popularity_num_buckets = int(conditioning_cfg.get("popularity_num_buckets", 16))
+    popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
+    use_popularity_history = bool(conditioning_cfg.get("use_popularity_history", use_popularity))
+    use_popularity_pooled = bool(conditioning_cfg.get("use_popularity_pooled", use_popularity))
 
-    train_item_frequencies = load_target_frequencies_from_dataset(train_dataset)
+    train_item_frequencies = load_target_frequencies_from_dataset(
+        train_dataset,
+        min_items=item_latent_table.shape[0],
+    )
+    popularity_bucket_ids = None
+    if use_popularity:
+        popularity_bucket_ids = torch.from_numpy(
+            build_popularity_bucket_ids(
+                train_item_frequencies,
+                num_buckets=popularity_num_buckets,
+            )
+        )
     train_item_weights = build_inverse_frequency_weights(
         train_item_frequencies,
         power=ranking_reweight_power,
@@ -499,6 +556,9 @@ def main() -> None:
         text_cond_dim=text_cond_dim,
         image_cond_dim=image_cond_dim,
         cf_cond_dim=cf_cond_dim,
+        popularity_cond_dim=(popularity_cond_dim if use_popularity else None),
+        popularity_num_buckets=(popularity_num_buckets if use_popularity else None),
+        item_popularity_bucket_ids=popularity_bucket_ids,
         use_text_history=bool(conditioning_cfg.get("use_text_history", conditioning_cfg.get("use_text", False))),
         use_text_pooled=bool(conditioning_cfg.get("use_text_pooled", conditioning_cfg.get("use_text", False))),
         use_text_target=bool(conditioning_cfg.get("use_target_text", False)),
@@ -508,6 +568,8 @@ def main() -> None:
         use_cf_history=bool(conditioning_cfg.get("use_cf_history", conditioning_cfg.get("use_cf", False))),
         use_cf_pooled=bool(conditioning_cfg.get("use_cf_pooled", conditioning_cfg.get("use_cf", False))),
         use_cf_target=bool(conditioning_cfg.get("use_target_cf", False)),
+        use_popularity_history=use_popularity_history,
+        use_popularity_pooled=use_popularity_pooled,
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
 
@@ -575,6 +637,9 @@ def main() -> None:
         "text_embedding_path": text_embedding_path,
         "image_embedding_path": image_embedding_path,
         "cf_embedding_path": cf_embedding_path,
+        "use_popularity": use_popularity,
+        "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
+        "popularity_cond_dim": popularity_cond_dim if use_popularity else None,
         "text_cond_dim": text_cond_dim,
         "image_cond_dim": image_cond_dim,
         "cf_cond_dim": cf_cond_dim,
