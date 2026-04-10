@@ -57,12 +57,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--eval_steps", type=int, default=None)
     parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--eval_every_epochs", type=int, default=None)
+    parser.add_argument("--save_every_epochs", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument(
         "--resume_from_checkpoint",
         type=Path,
         default=None,
         help="Checkpoint directory to resume from (e.g., output_dir/checkpoint-43000).",
+    )
+    parser.add_argument(
+        "--load_model_only_from_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Warm-start from a checkpoint by loading model weights only. "
+            "Optimizer/scheduler/global_step are reset so training restarts from epoch 0."
+        ),
     )
     parser.add_argument(
         "--mixed_precision",
@@ -385,6 +396,30 @@ def resume_from_checkpoint(
     return step
 
 
+def load_model_only_from_checkpoint(
+    *,
+    accelerator: Accelerator,
+    model: GenRecHybridDiffusionRunner,
+    checkpoint_dir: Path,
+) -> None:
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+    model_path = checkpoint_dir / "pytorch_model.bin"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    maybe_print(accelerator, f"[warmstart] loading model-only weights from {model_path}")
+    model_state = torch.load(model_path, map_location="cpu")
+    missing_keys, unexpected_keys = accelerator.unwrap_model(model).load_state_dict(
+        model_state,
+        strict=False,
+    )
+    if missing_keys:
+        maybe_print(accelerator, f"[warmstart] missing keys (first 10): {missing_keys[:10]}")
+    if unexpected_keys:
+        maybe_print(accelerator, f"[warmstart] unexpected keys (first 10): {unexpected_keys[:10]}")
+
+
 def main() -> None:
     args = parse_args()
     config = load_yaml(args.config_path)
@@ -465,6 +500,18 @@ def main() -> None:
     warmup_steps = int(resolve_training_value(args.warmup_steps, training_cfg, "warmup_steps", 0))
     eval_steps = resolve_training_value(args.eval_steps, training_cfg, "eval_steps", None)
     save_steps = resolve_training_value(args.save_steps, training_cfg, "save_steps", None)
+    eval_every_epochs = resolve_training_value(
+        args.eval_every_epochs,
+        training_cfg,
+        "eval_every_epochs",
+        None,
+    )
+    save_every_epochs = resolve_training_value(
+        args.save_every_epochs,
+        training_cfg,
+        "save_every_epochs",
+        None,
+    )
     diffusion_loss_weight = float(training_cfg.get("diffusion_loss_weight", 1.0))
     ranking_loss_weight = float(training_cfg.get("ranking_loss_weight", 0.0))
     ranking_temperature = float(training_cfg.get("ranking_temperature", 0.07))
@@ -623,6 +670,11 @@ def main() -> None:
         "config_path": str(args.config_path),
         "output_dir": str(output_dir),
         "resume_from_checkpoint": str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None,
+        "load_model_only_from_checkpoint": (
+            str(args.load_model_only_from_checkpoint)
+            if args.load_model_only_from_checkpoint
+            else None
+        ),
         "tokenized_root": str(tokenized_root),
         "train_split": train_split,
         "valid_split": valid_split if valid_dataset is not None else None,
@@ -654,6 +706,10 @@ def main() -> None:
         "diffusion_loss_weight": diffusion_loss_weight,
         "ranking_loss_weight": ranking_loss_weight,
         "ranking_temperature": ranking_temperature,
+        "eval_steps": int(eval_steps) if eval_steps else None,
+        "save_steps": int(save_steps) if save_steps else None,
+        "eval_every_epochs": int(eval_every_epochs) if eval_every_epochs else None,
+        "save_every_epochs": int(save_every_epochs) if save_every_epochs else None,
         "tail_sampler": {
             "enabled": tail_sampler_enabled,
             "power": tail_sampler_power,
@@ -674,7 +730,13 @@ def main() -> None:
     maybe_print(accelerator, json.dumps(run_manifest, indent=2, ensure_ascii=False))
 
     global_step = 0
-    if args.resume_from_checkpoint is not None:
+    if args.load_model_only_from_checkpoint is not None:
+        load_model_only_from_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            checkpoint_dir=args.load_model_only_from_checkpoint,
+        )
+    elif args.resume_from_checkpoint is not None:
         global_step = resume_from_checkpoint(
             accelerator=accelerator,
             model=model,
@@ -696,7 +758,11 @@ def main() -> None:
             f"[resume] global_step ({global_step}) already reached max_train_steps ({max_train_steps}), skipping training loop.",
         )
 
-    for _ in range(num_train_epochs):
+    starting_epoch = 0
+    if num_update_steps_per_epoch > 0 and global_step > 0:
+        starting_epoch = min(global_step // num_update_steps_per_epoch, num_train_epochs)
+
+    for epoch_idx in range(starting_epoch, num_train_epochs):
         model.train()
         for batch in train_loader:
             if global_step >= max_train_steps:
@@ -793,6 +859,46 @@ def main() -> None:
 
             if global_step >= max_train_steps:
                 break
+
+        completed_epoch = epoch_idx + 1
+        maybe_print(
+            accelerator,
+            f"[epoch {completed_epoch}/{num_train_epochs}] completed at global_step={global_step}",
+        )
+
+        if (
+            eval_every_epochs
+            and valid_loader is not None
+            and completed_epoch % int(eval_every_epochs) == 0
+        ):
+            metrics = evaluate(
+                accelerator=accelerator,
+                model=model,
+                dataloader=valid_loader,
+                item_latent_table=item_latent_table,
+                normalize_target_latent=normalize_target_latent,
+                diffusion_loss_weight=diffusion_loss_weight,
+                ranking_loss_weight=ranking_loss_weight,
+                ranking_temperature=ranking_temperature,
+                desc=f"EvalEpoch@{completed_epoch}",
+            )
+            if metrics:
+                maybe_print(
+                    accelerator,
+                    f"[eval epoch {completed_epoch}] "
+                    + " ".join(f"{key}={value:.6f}" for key, value in metrics.items()),
+                )
+
+        if save_every_epochs and completed_epoch % int(save_every_epochs) == 0:
+            save_checkpoint(
+                accelerator=accelerator,
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                output_dir=output_dir,
+                step=global_step,
+                run_manifest=run_manifest,
+            )
 
         if global_step >= max_train_steps:
             break
