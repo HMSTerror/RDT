@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated modality names to zero out at evaluation time for quick ablation, "
-            "e.g. 'text', 'image', 'cf', or 'text,image'."
+            "e.g. 'text', 'image', 'cf', 'popularity', or 'text,image'."
         ),
     )
     return parser.parse_args()
@@ -192,9 +192,9 @@ def parse_modalities(modality_arg: str) -> List[str]:
         name = item.strip().lower()
         if not name:
             continue
-        if name not in {"text", "image", "cf"}:
+        if name not in {"text", "image", "cf", "popularity"}:
             raise ValueError(
-                "--occlude_modalities only supports: text, image, cf "
+                "--occlude_modalities only supports: text, image, cf, popularity "
                 f"(got {name!r})."
             )
         if name not in values:
@@ -781,6 +781,7 @@ def main() -> None:
         sampled_latents = model.sample_latents(
             batch,
             num_inference_steps=args.num_inference_steps,
+            disable_popularity_condition=("popularity" in occluded_modalities),
         ).float()
         if normalize_target_latent:
             sampled_latents = F.normalize(sampled_latents, dim=-1)

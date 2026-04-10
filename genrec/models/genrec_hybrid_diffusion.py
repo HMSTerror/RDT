@@ -524,6 +524,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
         history_cf_embeds: torch.Tensor | None = None,
         target_cf_embed: torch.Tensor | None = None,
         pooled_cf_embed: torch.Tensor | None = None,
+        disable_popularity_condition: bool = False,
         **_: dict,
     ) -> HybridDiffusionOutput:
         history_masks = history_masks if history_masks is not None else history_mask
@@ -562,17 +563,20 @@ class GenRecHybridDiffusionRunner(nn.Module):
             pooled_embed=pooled_cf_embed,
             target_embed=target_cf_embed,
         )
-        history_popularity_embeds, pooled_popularity_embed = self._build_popularity_branch_inputs(
-            history_item_ids=history_item_ids,
-            history_masks=history_masks,
-        )
-        popularity_tokens, popularity_mask = self._project_condition_branch(
-            self.popularity_condition_projector,
-            history_embeds=history_popularity_embeds,
-            history_mask=history_masks,
-            pooled_embed=pooled_popularity_embed,
-            target_embed=None,
-        )
+        popularity_tokens = None
+        popularity_mask = None
+        if not disable_popularity_condition:
+            history_popularity_embeds, pooled_popularity_embed = self._build_popularity_branch_inputs(
+                history_item_ids=history_item_ids,
+                history_masks=history_masks,
+            )
+            popularity_tokens, popularity_mask = self._project_condition_branch(
+                self.popularity_condition_projector,
+                history_embeds=history_popularity_embeds,
+                history_mask=history_masks,
+                pooled_embed=pooled_popularity_embed,
+                target_embed=None,
+            )
 
         for block in self.blocks:
             hidden_states = block(
@@ -684,6 +688,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
         batch: SemanticIdBatch | dict[str, torch.Tensor],
         *,
         num_inference_steps: int = 50,
+        disable_popularity_condition: bool = False,
     ) -> torch.Tensor:
         if isinstance(batch, dict):
             batch = SemanticIdBatch.from_dict(batch)
@@ -726,6 +731,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 history_cf_embeds=batch.history_cf_embeds,
                 target_cf_embed=batch.target_cf_embed,
                 pooled_cf_embed=batch.pooled_cf_embed,
+                disable_popularity_condition=disable_popularity_condition,
                 noisy_target_latents=x_t,
                 timesteps=timesteps,
             )
