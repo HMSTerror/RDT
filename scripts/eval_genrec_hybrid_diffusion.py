@@ -480,6 +480,10 @@ def apply_modality_occlusion_inplace(batch: dict[str, torch.Tensor], modalities:
         ),
     }
     for modality in modalities:
+        if modality == "popularity":
+            # Popularity conditioning is disabled explicitly at sampling time and
+            # does not correspond to tensor branches stored in the batch.
+            continue
         for key in branch_to_keys[modality]:
             value = batch.get(key)
             if torch.is_tensor(value):

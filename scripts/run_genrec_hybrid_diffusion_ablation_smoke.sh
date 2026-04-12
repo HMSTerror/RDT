@@ -53,6 +53,7 @@ run_one() {
 }
 
 run_one "full" ""
+run_one "no_popularity" "popularity"
 run_one "no_text" "text"
 run_one "no_image" "image"
 run_one "no_cf" "cf"
@@ -65,7 +66,7 @@ from pathlib import Path
 
 metric_keys = ["mean_rank", "hit@10", "ndcg@10", "hit@20", "ndcg@20"]
 group_metric_keys = ["hit@20", "ndcg@20"]
-variants = ["full", "no_text", "no_image", "no_cf"]
+variants = ["full", "no_popularity", "no_text", "no_image", "no_cf"]
 
 run_root = Path(os.environ["RUN_ROOT"])
 

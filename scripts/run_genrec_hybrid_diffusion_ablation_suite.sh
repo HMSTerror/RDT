@@ -23,7 +23,7 @@ fi
 : "${MAX_EVAL_BATCHES:=0}"
 : "${PRINT_EVERY:=20}"
 : "${ABLATION_LOG_ROOT:=logs/genrec_ablation_suite}"
-: "${VARIANT_SPECS:=full=;no_text=text;no_image=image;no_cf=cf}"
+: "${VARIANT_SPECS:=full=;no_popularity=popularity;no_text=text;no_image=image;no_cf=cf}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${ABLATION_LOG_ROOT}/${STAMP}"
