@@ -26,7 +26,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from genrec.data import GenRecTokenizedCollator, GenRecTokenizedDataset  # noqa: E402
-from genrec.models import GenRecHybridDiffusionRunner  # noqa: E402
+from genrec.models import GenRecHybridDiffusionRunner, resolve_hybrid_conditioning_strategy  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -530,6 +530,7 @@ def main() -> None:
     popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
     use_popularity_history = bool(conditioning_cfg.get("use_popularity_history", use_popularity))
     use_popularity_pooled = bool(conditioning_cfg.get("use_popularity_pooled", use_popularity))
+    conditioning_strategy_kwargs = resolve_hybrid_conditioning_strategy(conditioning_cfg)
 
     train_item_frequencies = load_target_frequencies_from_dataset(
         train_dataset,
@@ -621,6 +622,7 @@ def main() -> None:
         use_cf_target=bool(conditioning_cfg.get("use_target_cf", False)),
         use_popularity_history=use_popularity_history,
         use_popularity_pooled=use_popularity_pooled,
+        **conditioning_strategy_kwargs,
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
 
@@ -696,6 +698,7 @@ def main() -> None:
         "use_popularity": use_popularity,
         "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
         "popularity_cond_dim": popularity_cond_dim if use_popularity else None,
+        "conditioning_strategy": conditioning_strategy_kwargs,
         "text_cond_dim": text_cond_dim,
         "image_cond_dim": image_cond_dim,
         "cf_cond_dim": cf_cond_dim,

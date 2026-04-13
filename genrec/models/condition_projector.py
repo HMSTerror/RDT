@@ -10,6 +10,9 @@ import torch.nn as nn
 class ConditionProjectorOutput:
     tokens: torch.Tensor | None
     attention_mask: torch.Tensor | None
+    history_token_count: int = 0
+    pooled_token_count: int = 0
+    target_token_count: int = 0
 
 
 class ConditionBranchProjector(nn.Module):
@@ -77,6 +80,10 @@ class ConditionBranchProjector(nn.Module):
         if batch_size is None:
             return ConditionProjectorOutput(tokens=None, attention_mask=None)
 
+        history_token_count = 0
+        pooled_token_count = 0
+        target_token_count = 0
+
         if self.use_history and history_embeds is not None:
             if history_embeds.ndim != 3:
                 raise ValueError(
@@ -96,6 +103,7 @@ class ConditionBranchProjector(nn.Module):
             hist_tokens = hist_tokens + self.history_pos_embed(positions)
             hist_tokens = hist_tokens + self.token_type_embed.weight[0].view(1, 1, -1)
             tokens.append(hist_tokens)
+            history_token_count = int(history_embeds.shape[1])
 
             if history_mask is None:
                 history_mask = torch.ones(
@@ -119,6 +127,7 @@ class ConditionBranchProjector(nn.Module):
             pooled_tokens = self.pooled_proj(pooled_embed).unsqueeze(1)
             pooled_tokens = pooled_tokens + self.token_type_embed.weight[1].view(1, 1, -1)
             tokens.append(pooled_tokens)
+            pooled_token_count = 1
 
             pooled_mask = valid_history_mask
             if pooled_mask is None:
@@ -137,6 +146,7 @@ class ConditionBranchProjector(nn.Module):
             target_tokens = self.target_proj(target_embed).unsqueeze(1)
             target_tokens = target_tokens + self.token_type_embed.weight[2].view(1, 1, -1)
             tokens.append(target_tokens)
+            target_token_count = 1
 
             if target_mask is None:
                 target_mask = torch.ones(
@@ -154,4 +164,10 @@ class ConditionBranchProjector(nn.Module):
         projected = torch.cat(tokens, dim=1).to(dtype=dtype)
         projected = self.dropout(self.norm(projected))
         attention_mask = torch.cat(masks, dim=1)
-        return ConditionProjectorOutput(tokens=projected, attention_mask=attention_mask)
+        return ConditionProjectorOutput(
+            tokens=projected,
+            attention_mask=attention_mask,
+            history_token_count=history_token_count,
+            pooled_token_count=pooled_token_count,
+            target_token_count=target_token_count,
+        )

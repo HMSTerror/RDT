@@ -1,4 +1,4 @@
-experiment_name: genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep
+experiment_name: genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v12
 
 data:
   dataset_name: amazon_music
@@ -39,7 +39,7 @@ conditioning:
   use_text: true
   use_image: true
   use_cf: true
-  use_popularity: true
+  use_popularity: false
   text_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_text.npy
   image_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_image.npy
   cf_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_cf.npy
@@ -56,6 +56,23 @@ conditioning:
   use_target_cf: false
   use_popularity_history: true
   use_popularity_pooled: true
+  layer_injection:
+    text: all
+    image: all
+    cf: front_half
+    popularity: none
+  training_dropout:
+    keep_pooled_condition_tokens: true
+    branch_dropout:
+      text: 0.20
+      image: 0.15
+      cf: 0.00
+      popularity: 0.00
+    history_token_keep_rate:
+      text: 0.85
+      image: 0.85
+      cf: 1.00
+      popularity: 1.00
 
 diffusion:
   prediction_type: epsilon

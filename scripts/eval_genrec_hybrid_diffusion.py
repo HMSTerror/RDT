@@ -21,7 +21,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from genrec.data import GenRecTokenizedCollator, GenRecTokenizedDataset  # noqa: E402
-from genrec.models import GenRecHybridDiffusionRunner  # noqa: E402
+from genrec.models import GenRecHybridDiffusionRunner, resolve_hybrid_conditioning_strategy  # noqa: E402
 
 
 """
@@ -634,6 +634,7 @@ def main() -> None:
     popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
     use_popularity_history = bool(conditioning_cfg.get("use_popularity_history", use_popularity))
     use_popularity_pooled = bool(conditioning_cfg.get("use_popularity_pooled", use_popularity))
+    conditioning_strategy_kwargs = resolve_hybrid_conditioning_strategy(conditioning_cfg)
 
     dataset, dataloader = build_dataloader(
         tokenized_root=tokenized_root,
@@ -701,6 +702,7 @@ def main() -> None:
         use_cf_target=bool(conditioning_cfg.get("use_target_cf", False)),
         use_popularity_history=use_popularity_history,
         use_popularity_pooled=use_popularity_pooled,
+        **conditioning_strategy_kwargs,
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
     load_model_checkpoint(model, args.checkpoint)

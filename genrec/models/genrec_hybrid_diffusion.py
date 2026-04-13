@@ -12,7 +12,7 @@ from timm.models.vision_transformer import RmsNorm
 from genrec.contracts import SemanticIdBatch
 from models.rdt.blocks import TimestepEmbedder
 
-from .condition_projector import ConditionBranchProjector
+from .condition_projector import ConditionBranchProjector, ConditionProjectorOutput
 from .genrec_dit import GenRecDiTBlock
 
 
@@ -22,6 +22,14 @@ class HybridDiffusionOutput:
     denoised_latents: torch.Tensor
     target_positions: torch.Tensor
     hidden_states: torch.Tensor
+
+
+@dataclass
+class BranchLayerSchedule:
+    text: tuple[bool, ...]
+    image: tuple[bool, ...]
+    cf: tuple[bool, ...]
+    popularity: tuple[bool, ...]
 
 
 class GenRecHybridDiffusionRunner(nn.Module):
@@ -65,6 +73,19 @@ class GenRecHybridDiffusionRunner(nn.Module):
         use_cf_target: bool = False,
         use_popularity_history: bool = True,
         use_popularity_pooled: bool = True,
+        text_injection_mode: str = "all",
+        image_injection_mode: str = "all",
+        cf_injection_mode: str = "all",
+        popularity_injection_mode: str = "all",
+        text_branch_dropout: float = 0.0,
+        image_branch_dropout: float = 0.0,
+        cf_branch_dropout: float = 0.0,
+        popularity_branch_dropout: float = 0.0,
+        text_history_token_keep_rate: float = 1.0,
+        image_history_token_keep_rate: float = 1.0,
+        cf_history_token_keep_rate: float = 1.0,
+        popularity_history_token_keep_rate: float = 1.0,
+        keep_pooled_condition_tokens: bool = True,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -88,6 +109,28 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 f"latent_dim={self.latent_dim} must be divisible by code_len={self.code_len}."
             )
         self.latent_slot_dim = self.latent_dim // self.code_len
+        self.layer_schedule = BranchLayerSchedule(
+            text=self._resolve_injection_schedule(text_injection_mode),
+            image=self._resolve_injection_schedule(image_injection_mode),
+            cf=self._resolve_injection_schedule(cf_injection_mode),
+            popularity=self._resolve_injection_schedule(popularity_injection_mode),
+        )
+        self.branch_dropout_probs = {
+            "text": self._validate_probability(text_branch_dropout, "text_branch_dropout"),
+            "image": self._validate_probability(image_branch_dropout, "image_branch_dropout"),
+            "cf": self._validate_probability(cf_branch_dropout, "cf_branch_dropout"),
+            "popularity": self._validate_probability(popularity_branch_dropout, "popularity_branch_dropout"),
+        }
+        self.history_token_keep_rates = {
+            "text": self._validate_probability(text_history_token_keep_rate, "text_history_token_keep_rate"),
+            "image": self._validate_probability(image_history_token_keep_rate, "image_history_token_keep_rate"),
+            "cf": self._validate_probability(cf_history_token_keep_rate, "cf_history_token_keep_rate"),
+            "popularity": self._validate_probability(
+                popularity_history_token_keep_rate,
+                "popularity_history_token_keep_rate",
+            ),
+        }
+        self.keep_pooled_condition_tokens = bool(keep_pooled_condition_tokens)
 
         self.token_embed = nn.Embedding(
             self.vocab_size,
@@ -112,7 +155,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
         self.final_norm = RmsNorm(self.hidden_size, eps=1e-6)
 
         self.text_condition_projector = None
-        if text_cond_dim is not None:
+        if text_cond_dim is not None and any(self.layer_schedule.text):
             self.text_condition_projector = ConditionBranchProjector(
                 input_dim=int(text_cond_dim),
                 hidden_size=self.hidden_size,
@@ -124,7 +167,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
             )
 
         self.image_condition_projector = None
-        if image_cond_dim is not None:
+        if image_cond_dim is not None and any(self.layer_schedule.image):
             self.image_condition_projector = ConditionBranchProjector(
                 input_dim=int(image_cond_dim),
                 hidden_size=self.hidden_size,
@@ -136,7 +179,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
             )
 
         self.cf_condition_projector = None
-        if cf_cond_dim is not None:
+        if cf_cond_dim is not None and any(self.layer_schedule.cf):
             self.cf_condition_projector = ConditionBranchProjector(
                 input_dim=int(cf_cond_dim),
                 hidden_size=self.hidden_size,
@@ -150,7 +193,11 @@ class GenRecHybridDiffusionRunner(nn.Module):
         self.popularity_condition_projector = None
         self.popularity_embedding = None
         self.popularity_padding_bucket_id: int | None = None
-        if popularity_cond_dim is not None and popularity_num_buckets is not None:
+        if (
+            popularity_cond_dim is not None
+            and popularity_num_buckets is not None
+            and any(self.layer_schedule.popularity)
+        ):
             if item_popularity_bucket_ids is None:
                 raise ValueError(
                     "item_popularity_bucket_ids must be provided when enabling popularity conditioning."
@@ -190,6 +237,28 @@ class GenRecHybridDiffusionRunner(nn.Module):
         )
 
         self._init_weights()
+
+    def _validate_probability(self, value: float, name: str) -> float:
+        value = float(value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1, got {value}.")
+        return value
+
+    def _resolve_injection_schedule(self, mode: str) -> tuple[bool, ...]:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode == "all":
+            return tuple(True for _ in range(self.depth))
+        if normalized_mode == "none":
+            return tuple(False for _ in range(self.depth))
+        if normalized_mode == "front_half":
+            cutoff = max(1, self.depth // 2)
+            return tuple(layer_idx < cutoff for layer_idx in range(self.depth))
+        if normalized_mode == "back_half":
+            cutoff = self.depth // 2
+            return tuple(layer_idx >= cutoff for layer_idx in range(self.depth))
+        raise ValueError(
+            f"Unsupported injection mode {mode!r}. Expected one of: all, none, front_half, back_half."
+        )
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.token_embed.weight, std=0.02)
@@ -249,6 +318,19 @@ class GenRecHybridDiffusionRunner(nn.Module):
         use_cf_target: bool = False,
         use_popularity_history: bool = True,
         use_popularity_pooled: bool = True,
+        text_injection_mode: str = "all",
+        image_injection_mode: str = "all",
+        cf_injection_mode: str = "all",
+        popularity_injection_mode: str = "all",
+        text_branch_dropout: float = 0.0,
+        image_branch_dropout: float = 0.0,
+        cf_branch_dropout: float = 0.0,
+        popularity_branch_dropout: float = 0.0,
+        text_history_token_keep_rate: float = 1.0,
+        image_history_token_keep_rate: float = 1.0,
+        cf_history_token_keep_rate: float = 1.0,
+        popularity_history_token_keep_rate: float = 1.0,
+        keep_pooled_condition_tokens: bool = True,
         dropout: float = 0.0,
     ) -> "GenRecHybridDiffusionRunner":
         special_tokens = manifest.get("special_tokens", {})
@@ -288,6 +370,19 @@ class GenRecHybridDiffusionRunner(nn.Module):
             use_cf_target=use_cf_target,
             use_popularity_history=use_popularity_history,
             use_popularity_pooled=use_popularity_pooled,
+            text_injection_mode=text_injection_mode,
+            image_injection_mode=image_injection_mode,
+            cf_injection_mode=cf_injection_mode,
+            popularity_injection_mode=popularity_injection_mode,
+            text_branch_dropout=text_branch_dropout,
+            image_branch_dropout=image_branch_dropout,
+            cf_branch_dropout=cf_branch_dropout,
+            popularity_branch_dropout=popularity_branch_dropout,
+            text_history_token_keep_rate=text_history_token_keep_rate,
+            image_history_token_keep_rate=image_history_token_keep_rate,
+            cf_history_token_keep_rate=cf_history_token_keep_rate,
+            popularity_history_token_keep_rate=popularity_history_token_keep_rate,
+            keep_pooled_condition_tokens=keep_pooled_condition_tokens,
             dropout=dropout,
         )
 
@@ -342,17 +437,83 @@ class GenRecHybridDiffusionRunner(nn.Module):
         pooled_embed: torch.Tensor | None,
         target_embed: torch.Tensor | None,
         target_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> ConditionProjectorOutput:
         if projector is None:
-            return None, None
-        output = projector(
+            return ConditionProjectorOutput(tokens=None, attention_mask=None)
+        return projector(
             history_embeds=history_embeds,
             history_mask=history_mask,
             pooled_embed=pooled_embed,
             target_embed=target_embed,
             target_mask=target_mask,
         )
-        return output.tokens, output.attention_mask
+
+    def _apply_conditioning_dropout(
+        self,
+        branch_name: str,
+        branch_output: ConditionProjectorOutput,
+    ) -> ConditionProjectorOutput:
+        if not self.training or branch_output.tokens is None or branch_output.attention_mask is None:
+            return branch_output
+
+        tokens = branch_output.tokens
+        attention_mask = branch_output.attention_mask
+        mask_changed = False
+
+        branch_dropout_prob = self.branch_dropout_probs.get(branch_name, 0.0)
+        if branch_dropout_prob > 0.0:
+            sample_drop_mask = torch.rand(
+                attention_mask.shape[0],
+                device=attention_mask.device,
+            ) < branch_dropout_prob
+            if sample_drop_mask.any():
+                attention_mask = attention_mask.clone()
+                attention_mask[sample_drop_mask] = False
+                mask_changed = True
+
+        history_token_count = int(branch_output.history_token_count)
+        history_keep_rate = self.history_token_keep_rates.get(branch_name, 1.0)
+        if history_token_count > 0 and history_keep_rate < 1.0:
+            history_mask = attention_mask[:, :history_token_count]
+            if history_mask.any():
+                sampled_keep_mask = torch.rand(
+                    history_mask.shape,
+                    device=history_mask.device,
+                ) < history_keep_rate
+                dropped_history_mask = history_mask & sampled_keep_mask
+
+                if branch_output.pooled_token_count == 0:
+                    empty_rows = history_mask.any(dim=1) & ~dropped_history_mask.any(dim=1)
+                    if empty_rows.any():
+                        dropped_history_mask = dropped_history_mask.clone()
+                        for row_idx in torch.nonzero(empty_rows, as_tuple=False).flatten():
+                            valid_positions = torch.nonzero(history_mask[row_idx], as_tuple=False).flatten()
+                            selected_position = valid_positions[
+                                torch.randint(valid_positions.numel(), (1,), device=history_mask.device)
+                            ]
+                            dropped_history_mask[row_idx, selected_position] = True
+
+                attention_mask = attention_mask.clone()
+                attention_mask[:, :history_token_count] = dropped_history_mask
+                mask_changed = True
+
+                if not self.keep_pooled_condition_tokens and branch_output.pooled_token_count > 0:
+                    pooled_start = history_token_count
+                    pooled_end = pooled_start + int(branch_output.pooled_token_count)
+                    attention_mask[:, pooled_start:pooled_end] = dropped_history_mask.any(dim=1, keepdim=True)
+
+        if not mask_changed:
+            return branch_output
+
+        masked_tokens = tokens.clone()
+        masked_tokens = masked_tokens.masked_fill(~attention_mask.unsqueeze(-1), 0.0)
+        return ConditionProjectorOutput(
+            tokens=masked_tokens,
+            attention_mask=attention_mask,
+            history_token_count=branch_output.history_token_count,
+            pooled_token_count=branch_output.pooled_token_count,
+            target_token_count=branch_output.target_token_count,
+        )
 
     def _extract_target_positions(
         self,
@@ -542,54 +703,71 @@ class GenRecHybridDiffusionRunner(nn.Module):
             labels=labels,
         )
 
-        text_tokens, text_mask = self._project_condition_branch(
-            self.text_condition_projector,
-            history_embeds=history_text_embeds,
-            history_mask=history_masks,
-            pooled_embed=pooled_text_embed,
-            target_embed=target_text_embed,
+        text_branch = self._apply_conditioning_dropout(
+            "text",
+            self._project_condition_branch(
+                self.text_condition_projector,
+                history_embeds=history_text_embeds,
+                history_mask=history_masks,
+                pooled_embed=pooled_text_embed,
+                target_embed=target_text_embed,
+            ),
         )
-        image_tokens, image_mask = self._project_condition_branch(
-            self.image_condition_projector,
-            history_embeds=history_image_embeds,
-            history_mask=history_masks,
-            pooled_embed=pooled_image_embed,
-            target_embed=target_image_embed,
+        image_branch = self._apply_conditioning_dropout(
+            "image",
+            self._project_condition_branch(
+                self.image_condition_projector,
+                history_embeds=history_image_embeds,
+                history_mask=history_masks,
+                pooled_embed=pooled_image_embed,
+                target_embed=target_image_embed,
+            ),
         )
-        cf_tokens, cf_mask = self._project_condition_branch(
-            self.cf_condition_projector,
-            history_embeds=history_cf_embeds,
-            history_mask=history_masks,
-            pooled_embed=pooled_cf_embed,
-            target_embed=target_cf_embed,
+        cf_branch = self._apply_conditioning_dropout(
+            "cf",
+            self._project_condition_branch(
+                self.cf_condition_projector,
+                history_embeds=history_cf_embeds,
+                history_mask=history_masks,
+                pooled_embed=pooled_cf_embed,
+                target_embed=target_cf_embed,
+            ),
         )
-        popularity_tokens = None
-        popularity_mask = None
-        if not disable_popularity_condition:
+        popularity_branch = ConditionProjectorOutput(tokens=None, attention_mask=None)
+        if not disable_popularity_condition and any(self.layer_schedule.popularity):
             history_popularity_embeds, pooled_popularity_embed = self._build_popularity_branch_inputs(
                 history_item_ids=history_item_ids,
                 history_masks=history_masks,
             )
-            popularity_tokens, popularity_mask = self._project_condition_branch(
-                self.popularity_condition_projector,
-                history_embeds=history_popularity_embeds,
-                history_mask=history_masks,
-                pooled_embed=pooled_popularity_embed,
-                target_embed=None,
+            popularity_branch = self._apply_conditioning_dropout(
+                "popularity",
+                self._project_condition_branch(
+                    self.popularity_condition_projector,
+                    history_embeds=history_popularity_embeds,
+                    history_mask=history_masks,
+                    pooled_embed=pooled_popularity_embed,
+                    target_embed=None,
+                ),
             )
 
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
                 attention_mask=attention_mask,
-                text_tokens=text_tokens,
-                text_mask=text_mask,
-                image_tokens=image_tokens,
-                image_mask=image_mask,
-                cf_tokens=cf_tokens,
-                cf_mask=cf_mask,
-                popularity_tokens=popularity_tokens,
-                popularity_mask=popularity_mask,
+                text_tokens=text_branch.tokens if self.layer_schedule.text[layer_idx] else None,
+                text_mask=text_branch.attention_mask if self.layer_schedule.text[layer_idx] else None,
+                image_tokens=image_branch.tokens if self.layer_schedule.image[layer_idx] else None,
+                image_mask=image_branch.attention_mask if self.layer_schedule.image[layer_idx] else None,
+                cf_tokens=cf_branch.tokens if self.layer_schedule.cf[layer_idx] else None,
+                cf_mask=cf_branch.attention_mask if self.layer_schedule.cf[layer_idx] else None,
+                popularity_tokens=(
+                    popularity_branch.tokens if self.layer_schedule.popularity[layer_idx] else None
+                ),
+                popularity_mask=(
+                    popularity_branch.attention_mask
+                    if self.layer_schedule.popularity[layer_idx]
+                    else None
+                ),
             )
 
         hidden_states = self.final_norm(hidden_states)
