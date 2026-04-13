@@ -56,6 +56,16 @@ conditioning:
   use_target_cf: false
   use_popularity_history: true
   use_popularity_pooled: true
+  # Available layer injection modes:
+  # - all
+  # - none
+  # - front_half
+  # - back_half
+  # - every_other
+  # - odd_layers
+  # - front_sparse
+  # - back_sparse
+  # - custom:0,2,4
   layer_injection:
     text: all
     image: all

@@ -256,8 +256,36 @@ class GenRecHybridDiffusionRunner(nn.Module):
         if normalized_mode == "back_half":
             cutoff = self.depth // 2
             return tuple(layer_idx >= cutoff for layer_idx in range(self.depth))
+        if normalized_mode == "every_other":
+            return tuple(layer_idx % 2 == 0 for layer_idx in range(self.depth))
+        if normalized_mode == "odd_layers":
+            return tuple(layer_idx % 2 == 1 for layer_idx in range(self.depth))
+        if normalized_mode == "front_sparse":
+            cutoff = max(1, self.depth // 2)
+            return tuple((layer_idx < cutoff) and (layer_idx % 2 == 0) for layer_idx in range(self.depth))
+        if normalized_mode == "back_sparse":
+            cutoff = self.depth // 2
+            return tuple((layer_idx >= cutoff) and (layer_idx % 2 == 0) for layer_idx in range(self.depth))
+        if normalized_mode.startswith("custom:"):
+            raw_values = normalized_mode.split(":", 1)[1].strip()
+            if not raw_values:
+                raise ValueError("custom injection mode requires explicit layer indices, e.g. custom:0,2,4")
+            active_layers = set()
+            for raw_value in raw_values.split(","):
+                value = raw_value.strip()
+                if not value:
+                    continue
+                layer_idx = int(value)
+                if not 0 <= layer_idx < self.depth:
+                    raise ValueError(
+                        f"Custom injection layer index {layer_idx} is out of range for depth={self.depth}."
+                    )
+                active_layers.add(layer_idx)
+            return tuple(layer_idx in active_layers for layer_idx in range(self.depth))
         raise ValueError(
-            f"Unsupported injection mode {mode!r}. Expected one of: all, none, front_half, back_half."
+            "Unsupported injection mode "
+            f"{mode!r}. Expected one of: all, none, front_half, back_half, "
+            "every_other, odd_layers, front_sparse, back_sparse, custom:<idxs>."
         )
 
     def _init_weights(self) -> None:
