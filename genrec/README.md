@@ -26,14 +26,19 @@ Key modules:
 Main entry points:
 
 - [scripts/prepare_genrec_semantic_ids.sh](/e:/RoboticsDiffusionTransformer/scripts/prepare_genrec_semantic_ids.sh)
-- [scripts/train_genrec_dit.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_dit.py)
-- [scripts/eval_genrec_dit.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_dit.py)
 - [scripts/train_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_hybrid_diffusion.py)
 - [scripts/eval_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_hybrid_diffusion.py)
+- [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh)
 
 Hybrid diffusion quick start:
 
 ```bash
 bash scripts/run_genrec_hybrid_diffusion_train50k_clean.sh
 bash scripts/run_genrec_hybrid_diffusion_eval.sh
+```
+
+Current recommended experiment entry:
+
+```bash
+bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh
 ```

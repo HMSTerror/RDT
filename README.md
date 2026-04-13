@@ -1,6 +1,6 @@
 # GenRec Hybrid Diffusion
 
-This repository now centers on a GenRec-style recommendation pipeline:
+This repository now centers on a GenRec-style hybrid diffusion recommendation pipeline:
 
 - raw Amazon review data
 - text / image / CF item embeddings
@@ -16,6 +16,7 @@ The active code path is built around:
 - [scripts/prepare_genrec_semantic_ids.sh](/e:/RoboticsDiffusionTransformer/scripts/prepare_genrec_semantic_ids.sh)
 - [scripts/train_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_hybrid_diffusion.py)
 - [scripts/eval_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_hybrid_diffusion.py)
+- [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh)
 
 ## Install
 
@@ -41,16 +42,22 @@ VISION_MODEL_NAME_OR_PATH=/path/to/siglip \
 bash scripts/prepare_genrec_semantic_ids.sh
 ```
 
-3. Train the hybrid diffusion model:
+3. Train the baseline hybrid diffusion model:
 
 ```bash
-bash scripts/run_genrec_hybrid_diffusion_train50k_clean.sh
-```
+ bash scripts/run_genrec_hybrid_diffusion_train50k_clean.sh
+ ```
 
 4. Evaluate on the grouped test split:
 
 ```bash
 bash scripts/run_genrec_hybrid_diffusion_eval.sh
+```
+
+5. For the current full-modal stage-2 workflow, run:
+
+```bash
+bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh
 ```
 
 ## Main Outputs
@@ -64,10 +71,10 @@ bash scripts/run_genrec_hybrid_diffusion_eval.sh
 - hybrid diffusion checkpoints:
   `checkpoints/genrec_hybrid_diffusion_amazon_50k/`
 - grouped evaluation artifacts:
-  `logs/genrec_hybrid_*`
+  `logs/genrec_hybrid_*`, `logs/genrec_stage2_fullmodal_*`
 
 ## Notes
 
 - `preprocess_amazon.py` is still part of the active pipeline because semantic-ID preparation depends on its split-aware buffer generation.
 - The evaluation script reports both overall retrieval metrics and grouped long-tail metrics on `cold`, `mid`, and `hot` items.
-- The repository also keeps a lighter GenRec-DiT baseline under [genrec/models/genrec_dit.py](/e:/RoboticsDiffusionTransformer/genrec/models/genrec_dit.py).
+- [genrec/models/genrec_dit.py](/e:/RoboticsDiffusionTransformer/genrec/models/genrec_dit.py) is retained as the shared semantic-token backbone block used by the hybrid diffusion model, not as a separate maintained training pipeline.
