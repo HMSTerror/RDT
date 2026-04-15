@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -121,20 +122,10 @@ def parse_args() -> argparse.Namespace:
         help="Which split supplies target-item observation frequency for popularity grouping.",
     )
     parser.add_argument(
-        "--popularity_penalty",
-        type=float,
-        default=None,
-        help=(
-            "Optional popularity penalty coefficient applied during retrieval reranking. "
-            "Uses normalized log(1 + frequency) from the configured source split."
-        ),
-    )
-    parser.add_argument(
-        "--popularity_penalty_source_split",
-        type=str,
-        default=None,
-        choices=["train", "val", "test"],
-        help="Which split supplies item frequencies for popularity reranking. Defaults to the config or frequency_source_split.",
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for diffusion sampling during evaluation.",
     )
     parser.add_argument(
         "--save_json",
@@ -166,7 +157,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Comma-separated modality names to zero out at evaluation time for quick ablation, "
-            "e.g. 'text', 'image', 'cf', 'popularity', or 'text,image'."
+            "e.g. 'text', 'image', 'cf', or 'text,image'."
         ),
     )
     return parser.parse_args()
@@ -192,9 +183,9 @@ def parse_modalities(modality_arg: str) -> List[str]:
         name = item.strip().lower()
         if not name:
             continue
-        if name not in {"text", "image", "cf", "popularity"}:
+        if name not in {"text", "image", "cf"}:
             raise ValueError(
-                "--occlude_modalities only supports: text, image, cf, popularity "
+                "--occlude_modalities only supports: text, image, cf "
                 f"(got {name!r})."
             )
         if name not in values:
@@ -433,14 +424,6 @@ def build_popularity_groups(
     return item_group_ids, metadata
 
 
-def build_normalized_popularity_penalty(frequencies: np.ndarray) -> np.ndarray:
-    penalties = np.log1p(np.asarray(frequencies, dtype=np.float64))
-    max_value = float(np.max(penalties)) if penalties.size else 0.0
-    if max_value > 0:
-        penalties = penalties / max_value
-    return penalties.astype(np.float32, copy=False)
-
-
 def build_popularity_bucket_ids(
     frequencies: np.ndarray,
     *,
@@ -480,14 +463,18 @@ def apply_modality_occlusion_inplace(batch: dict[str, torch.Tensor], modalities:
         ),
     }
     for modality in modalities:
-        if modality == "popularity":
-            # Popularity conditioning is disabled explicitly at sampling time and
-            # does not correspond to tensor branches stored in the batch.
-            continue
         for key in branch_to_keys[modality]:
             value = batch.get(key)
             if torch.is_tensor(value):
                 value.zero_()
+
+
+def set_eval_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def write_jsonl_records(path: Path, records: List[dict]) -> None:
@@ -602,11 +589,10 @@ def main() -> None:
     conditioning_cfg = config.get("conditioning", {})
     representation_cfg = config.get("representation", {})
     diffusion_cfg = config.get("diffusion", {})
-    evaluation_cfg = config.get("evaluation", {})
-
     topk_list = parse_topk(args.topk)
     max_k = max(topk_list)
     device = resolve_device(args.device)
+    set_eval_seed(args.seed)
 
     tokenized_root = Path(data_cfg["tokenized_root"])
     buffer_root = Path(data_cfg["split_root"])
@@ -742,27 +728,6 @@ def main() -> None:
         item_frequencies,
         strategy=args.group_strategy,
     )
-    popularity_penalty = float(
-        args.popularity_penalty
-        if args.popularity_penalty is not None
-        else evaluation_cfg.get("popularity_penalty", 0.0)
-    )
-    popularity_penalty_source_split = (
-        args.popularity_penalty_source_split
-        or evaluation_cfg.get("popularity_penalty_source_split")
-        or args.frequency_source_split
-    )
-    popularity_penalty_vector = None
-    if popularity_penalty > 0:
-        penalty_frequencies = load_split_target_frequencies(
-            tokenized_root=tokenized_root,
-            split=popularity_penalty_source_split,
-            num_items=item_latent_table.shape[0],
-        )
-        popularity_penalty_vector = torch.from_numpy(
-            build_normalized_popularity_penalty(penalty_frequencies)
-        ).to(device=device, dtype=torch.float32)
-
     if args.save_jsonl is not None and args.save_jsonl.exists():
         args.save_jsonl.unlink()
 
@@ -787,7 +752,6 @@ def main() -> None:
         sampled_latents = model.sample_latents(
             batch,
             num_inference_steps=args.num_inference_steps,
-            disable_popularity_condition=("popularity" in occluded_modalities),
         ).float()
         if normalize_target_latent:
             sampled_latents = F.normalize(sampled_latents, dim=-1)
@@ -805,8 +769,6 @@ def main() -> None:
                 history_masks=history_masks,
                 target_item_ids=target_item_ids,
             )
-        if popularity_penalty_vector is not None:
-            scores = scores - float(popularity_penalty) * popularity_penalty_vector.unsqueeze(0)
 
         target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
         ranks = 1 + (scores > target_scores).sum(dim=1)
@@ -890,13 +852,10 @@ def main() -> None:
         "topk": topk_list,
         "exclude_history_items": bool(args.exclude_history_items),
         "num_inference_steps": int(args.num_inference_steps),
+        "eval_seed": int(args.seed),
         "occluded_modalities": occluded_modalities,
         "use_popularity": use_popularity,
         "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
-        "popularity_penalty": float(popularity_penalty),
-        "popularity_penalty_source_split": (
-            popularity_penalty_source_split if popularity_penalty > 0 else None
-        ),
         "overall_metrics": overall_metrics,
         "grouping": {
             "reference": (

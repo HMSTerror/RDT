@@ -124,5 +124,3 @@ evaluation:
   exclude_history_items: true
   group_strategy: equal_items
   frequency_source_split: train
-  popularity_penalty: 0.0
-  popularity_penalty_source_split: train

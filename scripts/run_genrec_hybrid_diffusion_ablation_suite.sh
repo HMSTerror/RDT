@@ -19,11 +19,11 @@ fi
 : "${GROUP_STRATEGY:=equal_items}"
 : "${FREQUENCY_SOURCE_SPLIT:=train}"
 : "${EXCLUDE_HISTORY_ITEMS:=1}"
-: "${POPULARITY_PENALTY:=0}"
 : "${MAX_EVAL_BATCHES:=0}"
 : "${PRINT_EVERY:=20}"
+: "${EVAL_SEED:=42}"
 : "${ABLATION_LOG_ROOT:=logs/genrec_ablation_suite}"
-: "${VARIANT_SPECS:=full=;no_popularity=popularity;no_text=text;no_image=image;no_cf=cf}"
+: "${VARIANT_SPECS:=full=;no_text=text;no_image=image;no_cf=cf}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${ABLATION_LOG_ROOT}/${STAMP}"
@@ -47,9 +47,9 @@ run_one() {
   GROUP_STRATEGY="${GROUP_STRATEGY}" \
   FREQUENCY_SOURCE_SPLIT="${FREQUENCY_SOURCE_SPLIT}" \
   EXCLUDE_HISTORY_ITEMS="${EXCLUDE_HISTORY_ITEMS}" \
-  POPULARITY_PENALTY="${POPULARITY_PENALTY}" \
   MAX_EVAL_BATCHES="${MAX_EVAL_BATCHES}" \
   PRINT_EVERY="${PRINT_EVERY}" \
+  EVAL_SEED="${EVAL_SEED}" \
   OCCLUDE_MODALITIES="${occlude}" \
   LOG_DIR="${log_dir}" \
   bash scripts/run_genrec_hybrid_diffusion_eval.sh

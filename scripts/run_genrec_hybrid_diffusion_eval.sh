@@ -19,10 +19,9 @@ fi
 : "${EXCLUDE_HISTORY_ITEMS:=1}"
 : "${GROUP_STRATEGY:=equal_items}"
 : "${FREQUENCY_SOURCE_SPLIT:=train}"
-: "${POPULARITY_PENALTY:=}"
-: "${POPULARITY_PENALTY_SOURCE_SPLIT:=}"
 : "${MAX_EVAL_BATCHES:=0}"
 : "${PRINT_EVERY:=20}"
+: "${EVAL_SEED:=42}"
 : "${OCCLUDE_MODALITIES:=}"
 : "${LOG_DIR:=logs}"
 
@@ -56,6 +55,7 @@ CMD=(
   --frequency_source_split "${FREQUENCY_SOURCE_SPLIT}"
   --max_eval_batches "${MAX_EVAL_BATCHES}"
   --print_every "${PRINT_EVERY}"
+  --seed "${EVAL_SEED}"
   --save_json "${JSON_PATH}"
   --save_jsonl "${JSONL_PATH}"
   --save_plot "${PLOT_PATH}"
@@ -63,14 +63,6 @@ CMD=(
 
 if [[ "${EXCLUDE_HISTORY_ITEMS}" == "1" ]]; then
   CMD+=(--exclude_history_items)
-fi
-
-if [[ -n "${POPULARITY_PENALTY}" ]]; then
-  CMD+=(--popularity_penalty "${POPULARITY_PENALTY}")
-fi
-
-if [[ -n "${POPULARITY_PENALTY_SOURCE_SPLIT}" ]]; then
-  CMD+=(--popularity_penalty_source_split "${POPULARITY_PENALTY_SOURCE_SPLIT}")
 fi
 
 if [[ -n "${OCCLUDE_MODALITIES}" ]]; then
@@ -81,7 +73,7 @@ echo "========== Hybrid Diffusion Evaluation =========="
 echo "checkpoint: ${CHECKPOINT}"
 echo "split     : ${SPLIT}"
 echo "topk      : ${TOPK}"
-echo "pop_pen   : ${POPULARITY_PENALTY:-config-default}"
+echo "eval_seed : ${EVAL_SEED}"
 echo "occlude   : ${OCCLUDE_MODALITIES:-none}"
 echo "save_json : ${JSON_PATH}"
 echo "save_plot : ${PLOT_PATH}"

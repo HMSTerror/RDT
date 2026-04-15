@@ -19,9 +19,9 @@ fi
 : "${GROUP_STRATEGY:=equal_items}"
 : "${FREQUENCY_SOURCE_SPLIT:=train}"
 : "${EXCLUDE_HISTORY_ITEMS:=1}"
-: "${POPULARITY_PENALTY:=0}"
 : "${MAX_EVAL_BATCHES:=0}"
 : "${PRINT_EVERY:=20}"
+: "${EVAL_SEED:=42}"
 : "${ABLATION_LOG_ROOT:=logs/genrec_stage2_min_ablation}"
 
 if [[ -z "${CHECKPOINT}" ]]; then
@@ -45,9 +45,9 @@ TOPK="${TOPK}" \
 GROUP_STRATEGY="${GROUP_STRATEGY}" \
 FREQUENCY_SOURCE_SPLIT="${FREQUENCY_SOURCE_SPLIT}" \
 EXCLUDE_HISTORY_ITEMS="${EXCLUDE_HISTORY_ITEMS}" \
-POPULARITY_PENALTY="${POPULARITY_PENALTY}" \
 MAX_EVAL_BATCHES="${MAX_EVAL_BATCHES}" \
 PRINT_EVERY="${PRINT_EVERY}" \
+EVAL_SEED="${EVAL_SEED}" \
 ABLATION_LOG_ROOT="${ABLATION_LOG_ROOT}" \
-VARIANT_SPECS="full=;no_popularity=popularity;no_cf=cf;no_image=image" \
+VARIANT_SPECS="full=;no_cf=cf;no_image=image" \
 bash scripts/run_genrec_hybrid_diffusion_ablation_suite.sh
