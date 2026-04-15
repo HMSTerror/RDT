@@ -13,6 +13,8 @@ fi
 : "${OUTPUT_DIR:=checkpoints/genrec_hybrid_diffusion_amazon_50k}"
 : "${CHECKPOINT:=}"
 : "${SPLIT:=test}"
+: "${NUM_PROCESSES:=1}"
+: "${MIXED_PRECISION:=no}"
 : "${BATCH_SIZE:=16}"
 : "${NUM_INFERENCE_STEPS:=50}"
 : "${TOPK:=5,10,20}"
@@ -40,6 +42,8 @@ run_one() {
   CHECKPOINT="${CHECKPOINT}" \
   OUTPUT_DIR="${OUTPUT_DIR}" \
   CONFIG_PATH="${CONFIG_PATH}" \
+  NUM_PROCESSES="${NUM_PROCESSES}" \
+  MIXED_PRECISION="${MIXED_PRECISION}" \
   SPLIT="${SPLIT}" \
   BATCH_SIZE="${BATCH_SIZE}" \
   NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS}" \

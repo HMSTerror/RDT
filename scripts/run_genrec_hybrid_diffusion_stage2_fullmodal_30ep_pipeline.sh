@@ -78,6 +78,8 @@ echo "========== Final Full Evaluation =========="
 CHECKPOINT="${FINAL_CHECKPOINT}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 CONFIG_PATH="${CONFIG_PATH}" \
+NUM_PROCESSES="${NUM_PROCESSES}" \
+MIXED_PRECISION="${MIXED_PRECISION}" \
 LOG_DIR="${FINAL_EVAL_LOG_DIR}" \
 bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_eval.sh
 
@@ -85,5 +87,7 @@ echo "========== Final Ablation Suite =========="
 CHECKPOINT="${FINAL_CHECKPOINT}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 CONFIG_PATH="${CONFIG_PATH}" \
+NUM_PROCESSES="${NUM_PROCESSES}" \
+MIXED_PRECISION="${MIXED_PRECISION}" \
 ABLATION_LOG_ROOT="${ABLATION_LOG_ROOT}" \
 bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_ablation_suite.sh

@@ -13,6 +13,8 @@ fi
 : "${OUTPUT_DIR:=checkpoints/genrec_hybrid_diffusion_amazon_50k}"
 : "${CHECKPOINT:=}"
 : "${SPLIT:=test}"
+: "${NUM_PROCESSES:=1}"
+: "${MIXED_PRECISION:=no}"
 : "${BATCH_SIZE:=16}"
 : "${NUM_INFERENCE_STEPS:=50}"
 : "${TOPK:=5,10,20}"
@@ -44,11 +46,15 @@ JSONL_PATH="${LOG_DIR}/genrec_hybrid_${SPLIT}_grouped_predictions_${STAMP}.jsonl
 PLOT_PATH="${LOG_DIR}/genrec_hybrid_${SPLIT}_grouped_metrics_${STAMP}.png"
 
 CMD=(
-  python scripts/eval_genrec_hybrid_diffusion.py
+  accelerate launch
+  --num_processes "${NUM_PROCESSES}"
+  --mixed_precision "${MIXED_PRECISION}"
+  scripts/eval_genrec_hybrid_diffusion.py
   --config_path "${CONFIG_PATH}"
   --checkpoint "${CHECKPOINT}"
   --split "${SPLIT}"
   --batch_size "${BATCH_SIZE}"
+  --mixed_precision "${MIXED_PRECISION}"
   --num_inference_steps "${NUM_INFERENCE_STEPS}"
   --topk "${TOPK}"
   --group_strategy "${GROUP_STRATEGY}"
@@ -73,6 +79,8 @@ echo "========== Hybrid Diffusion Evaluation =========="
 echo "checkpoint: ${CHECKPOINT}"
 echo "split     : ${SPLIT}"
 echo "topk      : ${TOPK}"
+echo "num_proc  : ${NUM_PROCESSES}"
+echo "precision : ${MIXED_PRECISION}"
 echo "eval_seed : ${EVAL_SEED}"
 echo "occlude   : ${OCCLUDE_MODALITIES:-none}"
 echo "save_json : ${JSON_PATH}"

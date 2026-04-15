@@ -85,4 +85,5 @@ bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.s
 - `preprocess_amazon.py` is still part of the active pipeline because semantic-ID preparation depends on its split-aware buffer generation.
 - The evaluation script reports both overall retrieval metrics and grouped long-tail metrics on `cold`, `mid`, and `hot` items.
 - `scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh` now skips a separate final full evaluation by default and goes directly to the ablation suite, because the ablation suite already includes a `full` run. Set `RUN_FINAL_FULL_EVAL=1` if you want both.
+- Stage-2 eval and ablation wrappers now support distributed `accelerate launch`. On a dual-GPU server you can set `NUM_PROCESSES=2 MIXED_PRECISION=bf16` so the final full eval and ablation runs use both cards instead of a single process.
 - [genrec/models/genrec_dit.py](/e:/RoboticsDiffusionTransformer/genrec/models/genrec_dit.py) is retained as the shared semantic-token backbone block used by the hybrid diffusion model, not as a separate maintained training pipeline.

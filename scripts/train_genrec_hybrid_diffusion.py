@@ -142,6 +142,89 @@ def resolve_training_value(cli_value, config_section: dict, key: str, default):
     return config_section.get(key, default)
 
 
+def append_metrics_history(history_path: Path, record: dict) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(history_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def plot_loss_curve(
+    *,
+    history_records: list[dict],
+    save_path: Path,
+) -> Path | None:
+    train_records = [
+        record
+        for record in history_records
+        if record.get("split") == "train" and record.get("scope") == "epoch"
+    ]
+    val_records = [
+        record
+        for record in history_records
+        if record.get("split") == "val"
+    ]
+    if not train_records and not val_records:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    if train_records:
+        train_epochs = [int(record["epoch"]) for record in train_records]
+        train_losses = [float(record["loss"]) for record in train_records]
+        ax.plot(
+            train_epochs,
+            train_losses,
+            marker="o",
+            linewidth=2.0,
+            label="Train Loss",
+        )
+
+    if val_records:
+        val_epochs = [float(record["epoch"]) for record in val_records]
+        val_losses = [float(record["loss"]) for record in val_records]
+        val_labels = [
+            "Val Loss (Final)" if record.get("scope") == "final" else "Val Loss"
+            for record in val_records
+        ]
+        plotted_val = False
+        for epoch, loss, label in zip(val_epochs, val_losses, val_labels):
+            ax.scatter(
+                [epoch],
+                [loss],
+                s=60,
+                marker="s" if label.endswith("(Final)") else "o",
+                label=label if not plotted_val or label.endswith("(Final)") else None,
+                zorder=3,
+            )
+            plotted_val = True
+        if len(val_epochs) > 1:
+            ax.plot(
+                val_epochs,
+                val_losses,
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.8,
+                color="C1",
+            )
+
+    ax.set_title("Hybrid Diffusion Train / Val Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(alpha=0.25)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
 def load_target_frequencies_from_dataset(
     dataset: GenRecTokenizedDataset,
     *,
@@ -732,6 +815,13 @@ def main() -> None:
     maybe_print(accelerator, "========== Hybrid GenRec Diffusion Training ==========")
     maybe_print(accelerator, json.dumps(run_manifest, indent=2, ensure_ascii=False))
 
+    metrics_history_path = output_dir / "metrics_history.jsonl"
+    loss_curve_path = output_dir / "loss_curve.png"
+    if accelerator.is_main_process and metrics_history_path.exists():
+        metrics_history_path.unlink()
+    accelerator.wait_for_everyone()
+    metrics_history_records: list[dict] = []
+
     global_step = 0
     if args.load_model_only_from_checkpoint is not None:
         load_model_only_from_checkpoint(
@@ -767,6 +857,9 @@ def main() -> None:
 
     for epoch_idx in range(starting_epoch, num_train_epochs):
         model.train()
+        epoch_train_losses: list[float] = []
+        epoch_train_diffusion_losses: list[float] = []
+        epoch_train_ranking_losses: list[float] = []
         for batch in train_loader:
             if global_step >= max_train_steps:
                 break
@@ -830,6 +923,14 @@ def main() -> None:
                     msg += f" rank={loss_dict['ranking_loss'].detach().float().item():.6f}"
                 maybe_print(accelerator, msg)
 
+            gathered_total = accelerator.gather_for_metrics(loss.detach().reshape(1))
+            gathered_diff = accelerator.gather_for_metrics(loss_dict["diffusion_loss"].detach().reshape(1))
+            epoch_train_losses.append(float(gathered_total.mean().item()))
+            epoch_train_diffusion_losses.append(float(gathered_diff.mean().item()))
+            if "ranking_loss" in loss_dict:
+                gathered_rank = accelerator.gather_for_metrics(loss_dict["ranking_loss"].detach().reshape(1))
+                epoch_train_ranking_losses.append(float(gathered_rank.mean().item()))
+
             if eval_steps and valid_loader is not None and global_step % int(eval_steps) == 0:
                 metrics = evaluate(
                     accelerator=accelerator,
@@ -848,6 +949,16 @@ def main() -> None:
                         f"[eval {global_step}] "
                         + " ".join(f"{key}={value:.6f}" for key, value in metrics.items()),
                     )
+                    if accelerator.is_main_process:
+                        history_record = {
+                            "split": "val",
+                            "scope": "step",
+                            "step": int(global_step),
+                            "epoch": float(epoch_idx + 1),
+                            **{key: float(value) for key, value in metrics.items()},
+                        }
+                        metrics_history_records.append(history_record)
+                        append_metrics_history(metrics_history_path, history_record)
 
             if save_steps and global_step % int(save_steps) == 0:
                 save_checkpoint(
@@ -868,6 +979,34 @@ def main() -> None:
             accelerator,
             f"[epoch {completed_epoch}/{num_train_epochs}] completed at global_step={global_step}",
         )
+
+        epoch_metrics = {}
+        if epoch_train_losses:
+            epoch_metrics["loss"] = float(sum(epoch_train_losses) / len(epoch_train_losses))
+        if epoch_train_diffusion_losses:
+            epoch_metrics["diffusion_loss"] = float(
+                sum(epoch_train_diffusion_losses) / len(epoch_train_diffusion_losses)
+            )
+        if epoch_train_ranking_losses:
+            epoch_metrics["ranking_loss"] = float(
+                sum(epoch_train_ranking_losses) / len(epoch_train_ranking_losses)
+            )
+        if epoch_metrics:
+            maybe_print(
+                accelerator,
+                f"[train epoch {completed_epoch}] "
+                + " ".join(f"{key}={value:.6f}" for key, value in epoch_metrics.items()),
+            )
+            if accelerator.is_main_process:
+                history_record = {
+                    "split": "train",
+                    "scope": "epoch",
+                    "step": int(global_step),
+                    "epoch": int(completed_epoch),
+                    **epoch_metrics,
+                }
+                metrics_history_records.append(history_record)
+                append_metrics_history(metrics_history_path, history_record)
 
         if (
             eval_every_epochs
@@ -891,6 +1030,16 @@ def main() -> None:
                     f"[eval epoch {completed_epoch}] "
                     + " ".join(f"{key}={value:.6f}" for key, value in metrics.items()),
                 )
+                if accelerator.is_main_process:
+                    history_record = {
+                        "split": "val",
+                        "scope": "epoch",
+                        "step": int(global_step),
+                        "epoch": int(completed_epoch),
+                        **{key: float(value) for key, value in metrics.items()},
+                    }
+                    metrics_history_records.append(history_record)
+                    append_metrics_history(metrics_history_path, history_record)
 
         if save_every_epochs and completed_epoch % int(save_every_epochs) == 0:
             save_checkpoint(
@@ -924,18 +1073,37 @@ def main() -> None:
                 accelerator,
                 "[final eval] " + " ".join(f"{key}={value:.6f}" for key, value in final_metrics.items()),
             )
+            if accelerator.is_main_process:
+                history_record = {
+                    "split": "val",
+                    "scope": "final",
+                    "step": int(global_step),
+                    "epoch": int(num_train_epochs),
+                    **{key: float(value) for key, value in final_metrics.items()},
+                }
+                metrics_history_records.append(history_record)
+                append_metrics_history(metrics_history_path, history_record)
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         final_dir = output_dir / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
+        saved_curve_path = plot_loss_curve(
+            history_records=metrics_history_records,
+            save_path=loss_curve_path,
+        )
         torch.save(accelerator.unwrap_model(model).state_dict(), final_dir / "pytorch_model.bin")
         with open(final_dir / "run_manifest.json", "w", encoding="utf-8") as fp:
             payload = dict(run_manifest)
             payload["final_metrics"] = final_metrics
+            payload["metrics_history_path"] = str(metrics_history_path)
+            payload["loss_curve_path"] = str(saved_curve_path) if saved_curve_path is not None else None
             json.dump(payload, fp, indent=2, ensure_ascii=False)
         print(f"saved_final_model = {final_dir / 'pytorch_model.bin'}")
+        print(f"saved_metrics_history = {metrics_history_path}")
+        if saved_curve_path is not None:
+            print(f"saved_loss_curve = {saved_curve_path}")
 
 
 if __name__ == "__main__":

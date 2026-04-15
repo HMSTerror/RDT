@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from accelerate import Accelerator
 from tqdm import tqdm
 
 
@@ -74,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode for distributed evaluation launched via accelerate.",
+    )
     parser.add_argument(
         "--num_inference_steps",
         type=int,
@@ -583,6 +591,7 @@ def plot_grouped_metrics(
 def main() -> None:
     args = parse_args()
     occluded_modalities = parse_modalities(args.occlude_modalities)
+    accelerator = Accelerator(mixed_precision=args.mixed_precision)
     config = load_yaml(args.config_path)
     data_cfg = config.get("data", {})
     backbone_cfg = config.get("backbone", {})
@@ -591,7 +600,15 @@ def main() -> None:
     diffusion_cfg = config.get("diffusion", {})
     topk_list = parse_topk(args.topk)
     max_k = max(topk_list)
-    device = resolve_device(args.device)
+    if accelerator.num_processes > 1:
+        if args.device is not None and accelerator.is_main_process:
+            print(
+                "[warn] --device is ignored when running distributed evaluation; "
+                f"using accelerator device {accelerator.device}."
+            )
+        device = accelerator.device
+    else:
+        device = resolve_device(args.device)
     set_eval_seed(args.seed)
 
     tokenized_root = Path(data_cfg["tokenized_root"])
@@ -632,6 +649,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
+    dataloader = accelerator.prepare(dataloader)
 
     tokenized_manifest = dataset.manifest
     history_len = int(tokenized_manifest["splits"][train_split]["history_len"])
@@ -728,8 +746,9 @@ def main() -> None:
         item_frequencies,
         strategy=args.group_strategy,
     )
-    if args.save_jsonl is not None and args.save_jsonl.exists():
+    if accelerator.is_main_process and args.save_jsonl is not None and args.save_jsonl.exists():
         args.save_jsonl.unlink()
+    accelerator.wait_for_everyone()
 
     overall_tracker = RetrievalMetricTracker(topk_list)
     group_trackers = {group_name: RetrievalMetricTracker(topk_list) for group_name in GROUP_NAMES}
@@ -737,7 +756,13 @@ def main() -> None:
     if args.max_eval_batches > 0:
         total_batches = min(total_batches, args.max_eval_batches)
 
-    progress_bar = tqdm(dataloader, total=total_batches, desc="Hybrid Retrieval Eval", unit="batch")
+    progress_bar = tqdm(
+        dataloader,
+        total=total_batches,
+        desc="Hybrid Retrieval Eval",
+        unit="batch",
+        disable=not accelerator.is_local_main_process,
+    )
     global_sample_offset = 0
 
     for step, batch in enumerate(progress_bar, start=1):
@@ -749,10 +774,12 @@ def main() -> None:
             for key, value in batch.items()
         }
         apply_modality_occlusion_inplace(batch, occluded_modalities)
-        sampled_latents = model.sample_latents(
-            batch,
-            num_inference_steps=args.num_inference_steps,
-        ).float()
+        with accelerator.autocast():
+            sampled_latents = model.sample_latents(
+                batch,
+                num_inference_steps=args.num_inference_steps,
+            )
+        sampled_latents = sampled_latents.float()
         if normalize_target_latent:
             sampled_latents = F.normalize(sampled_latents, dim=-1)
 
@@ -772,43 +799,59 @@ def main() -> None:
 
         target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
         ranks = 1 + (scores > target_scores).sum(dim=1)
-        overall_tracker.update(ranks)
-
-        batch_group_ids = torch.from_numpy(item_group_ids[target_item_ids.detach().cpu().numpy()]).to(torch.long)
-        for group_id, group_name in enumerate(GROUP_NAMES):
-            group_mask = batch_group_ids == group_id
-            if group_mask.any():
-                group_trackers[group_name].update(ranks[group_mask.to(device=ranks.device)])
+        batch_group_ids = torch.from_numpy(item_group_ids[target_item_ids.detach().cpu().numpy()]).to(
+            device=device,
+            dtype=torch.long,
+        )
+        gathered_ranks = accelerator.gather_for_metrics(ranks)
+        gathered_group_ids = accelerator.gather_for_metrics(batch_group_ids)
+        if accelerator.is_main_process:
+            overall_tracker.update(gathered_ranks)
+            for group_id, group_name in enumerate(GROUP_NAMES):
+                group_mask = gathered_group_ids == group_id
+                if group_mask.any():
+                    group_trackers[group_name].update(gathered_ranks[group_mask])
 
         topk_scores, topk_indices = torch.topk(scores, k=max_k, dim=1)
-        running_metrics = overall_tracker.compute()
-        postfix = {"mean_rank": f"{running_metrics.get('mean_rank', 0.0):.2f}"}
-        for k in topk_list:
-            postfix[f"ndcg@{k}"] = f"{running_metrics.get(f'ndcg@{k}', 0.0):.4f}"
-            postfix[f"hit@{k}"] = f"{running_metrics.get(f'hit@{k}', 0.0):.4f}"
-        progress_bar.set_postfix(postfix)
+        if accelerator.is_main_process:
+            running_metrics = overall_tracker.compute()
+            postfix = {"mean_rank": f"{running_metrics.get('mean_rank', 0.0):.2f}"}
+            for k in topk_list:
+                postfix[f"ndcg@{k}"] = f"{running_metrics.get(f'ndcg@{k}', 0.0):.4f}"
+                postfix[f"hit@{k}"] = f"{running_metrics.get(f'hit@{k}', 0.0):.4f}"
+            progress_bar.set_postfix(postfix)
 
         if args.save_jsonl is not None:
+            gathered_target_item_ids = accelerator.gather_for_metrics(target_item_ids)
+            gathered_history_item_ids = accelerator.gather_for_metrics(history_item_ids)
+            gathered_history_masks = accelerator.gather_for_metrics(history_masks.to(dtype=torch.long))
+            gathered_topk_indices = accelerator.gather_for_metrics(topk_indices)
+            gathered_topk_scores = accelerator.gather_for_metrics(topk_scores)
+            gathered_ranks_for_jsonl = gathered_ranks
+            gathered_group_ids_for_jsonl = gathered_group_ids
+
+        if accelerator.is_main_process and args.save_jsonl is not None:
             records: List[dict] = []
-            for row_idx in range(target_item_ids.shape[0]):
-                row_target_item_idx = int(target_item_ids[row_idx].item())
+            gathered_history_masks = gathered_history_masks.to(dtype=torch.bool)
+            for row_idx in range(gathered_target_item_ids.shape[0]):
+                row_target_item_idx = int(gathered_target_item_ids[row_idx].item())
                 row_target_item_id = idx_to_item[row_target_item_idx]
                 row_history = []
                 for hist_idx, hist_valid in zip(
-                    history_item_ids[row_idx].tolist(),
-                    history_masks[row_idx].tolist(),
+                    gathered_history_item_ids[row_idx].tolist(),
+                    gathered_history_masks[row_idx].tolist(),
                 ):
                     if bool(hist_valid) and int(hist_idx) >= 0:
                         row_history.append(idx_to_item[int(hist_idx)])
                 row_retrieved = []
                 for rank_pos in range(max_k):
-                    item_idx = int(topk_indices[row_idx, rank_pos].item())
+                    item_idx = int(gathered_topk_indices[row_idx, rank_pos].item())
                     row_retrieved.append(
                         {
                             "rank": rank_pos + 1,
                             "item_idx": item_idx,
                             "item_id": idx_to_item[item_idx],
-                            "score": float(topk_scores[row_idx, rank_pos].item()),
+                            "score": float(gathered_topk_scores[row_idx, rank_pos].item()),
                         }
                     )
                 global_index = global_sample_offset + row_idx
@@ -818,81 +861,82 @@ def main() -> None:
                         "sample_index": int(global_index),
                         "target_item_idx": row_target_item_idx,
                         "target_item_id": row_target_item_id,
-                        "target_rank": int(ranks[row_idx].item()),
+                        "target_rank": int(gathered_ranks_for_jsonl[row_idx].item()),
                         "history_items": row_history,
                         "retrieved_topk": row_retrieved,
-                        "group": GROUP_NAMES[int(batch_group_ids[row_idx].item())],
+                        "group": GROUP_NAMES[int(gathered_group_ids_for_jsonl[row_idx].item())],
                     }
                 )
             write_jsonl_records(args.save_jsonl, records)
+            global_sample_offset += int(gathered_target_item_ids.shape[0])
 
-        if args.print_every > 0 and step % args.print_every == 0:
+        if accelerator.is_main_process and args.print_every > 0 and step % args.print_every == 0:
             print(f"[batch {step}/{total_batches}] {json.dumps(running_metrics, ensure_ascii=False)}")
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        overall_metrics = overall_tracker.compute()
+        group_metrics = {}
+        for group_name in GROUP_NAMES:
+            group_metrics[group_name] = {
+                "name_zh": GROUP_NAMES_ZH[group_name],
+                "sample_count": int(group_trackers[group_name].total),
+                **group_trackers[group_name].compute(),
+            }
 
-        global_sample_offset += target_item_ids.shape[0]
-
-    overall_metrics = overall_tracker.compute()
-    group_metrics = {}
-    for group_name in GROUP_NAMES:
-        group_metrics[group_name] = {
-            "name_zh": GROUP_NAMES_ZH[group_name],
-            "sample_count": int(group_trackers[group_name].total),
-            **group_trackers[group_name].compute(),
+        final_payload = {
+            "split": args.split,
+            "checkpoint": str(args.checkpoint),
+            "tokenized_root": str(tokenized_root),
+            "buffer_root": str(buffer_root),
+            "target_latent_path": str(target_latent_path),
+            "item_id_mapping_source": item_id_mapping_source,
+            "evaluated_samples": int(overall_tracker.total),
+            "candidate_items": int(item_latent_table.shape[0]),
+            "topk": topk_list,
+            "exclude_history_items": bool(args.exclude_history_items),
+            "num_inference_steps": int(args.num_inference_steps),
+            "eval_seed": int(args.seed),
+            "num_processes": int(accelerator.num_processes),
+            "occluded_modalities": occluded_modalities,
+            "use_popularity": use_popularity,
+            "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
+            "overall_metrics": overall_metrics,
+            "grouping": {
+                "reference": (
+                    "Grouped by item observation frequency, following the report's idea of "
+                    "using item occurrence count as frequency."
+                ),
+                "frequency_source_split": args.frequency_source_split,
+                **grouping_metadata,
+            },
+            "group_metrics": group_metrics,
         }
 
-    final_payload = {
-        "split": args.split,
-        "checkpoint": str(args.checkpoint),
-        "tokenized_root": str(tokenized_root),
-        "buffer_root": str(buffer_root),
-        "target_latent_path": str(target_latent_path),
-        "item_id_mapping_source": item_id_mapping_source,
-        "evaluated_samples": int(overall_tracker.total),
-        "candidate_items": int(item_latent_table.shape[0]),
-        "topk": topk_list,
-        "exclude_history_items": bool(args.exclude_history_items),
-        "num_inference_steps": int(args.num_inference_steps),
-        "eval_seed": int(args.seed),
-        "occluded_modalities": occluded_modalities,
-        "use_popularity": use_popularity,
-        "popularity_num_buckets": popularity_num_buckets if use_popularity else None,
-        "overall_metrics": overall_metrics,
-        "grouping": {
-            "reference": (
-                "Grouped by item observation frequency, following the report's idea of "
-                "using item occurrence count as frequency."
-            ),
-            "frequency_source_split": args.frequency_source_split,
-            **grouping_metadata,
-        },
-        "group_metrics": group_metrics,
-    }
+        plot_path = resolve_plot_path(args)
+        if plot_path is not None:
+            saved_plot_path = plot_grouped_metrics(
+                save_path=plot_path,
+                split=args.split,
+                topk_list=topk_list,
+                overall_metrics=overall_metrics,
+                group_metrics=group_metrics,
+            )
+            final_payload["saved_plot"] = str(saved_plot_path)
 
-    plot_path = resolve_plot_path(args)
-    if plot_path is not None:
-        saved_plot_path = plot_grouped_metrics(
-            save_path=plot_path,
-            split=args.split,
-            topk_list=topk_list,
-            overall_metrics=overall_metrics,
-            group_metrics=group_metrics,
-        )
-        final_payload["saved_plot"] = str(saved_plot_path)
+        print("")
+        print("========== Hybrid Diffusion Final Evaluation ==========")
+        print(json.dumps(final_payload, indent=2, ensure_ascii=False))
 
-    print("")
-    print("========== Hybrid Diffusion Final Evaluation ==========")
-    print(json.dumps(final_payload, indent=2, ensure_ascii=False))
+        if args.save_json is not None:
+            args.save_json.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.save_json, "w", encoding="utf-8") as fp:
+                json.dump(final_payload, fp, indent=2, ensure_ascii=False)
+            print(f"saved_json = {args.save_json}")
 
-    if args.save_json is not None:
-        args.save_json.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.save_json, "w", encoding="utf-8") as fp:
-            json.dump(final_payload, fp, indent=2, ensure_ascii=False)
-        print(f"saved_json = {args.save_json}")
-
-    if args.save_jsonl is not None:
-        print(f"saved_jsonl = {args.save_jsonl}")
-    if plot_path is not None:
-        print(f"saved_plot = {plot_path}")
+        if args.save_jsonl is not None:
+            print(f"saved_jsonl = {args.save_jsonl}")
+        if plot_path is not None:
+            print(f"saved_plot = {plot_path}")
 
 
 if __name__ == "__main__":
