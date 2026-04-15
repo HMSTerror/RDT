@@ -29,6 +29,7 @@ Main entry points:
 - [scripts/train_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_hybrid_diffusion.py)
 - [scripts/eval_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_hybrid_diffusion.py)
 - [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh)
+- [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh)
 
 Hybrid diffusion quick start:
 
@@ -42,3 +43,11 @@ Current recommended experiment entry:
 ```bash
 bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh
 ```
+
+For from-scratch stage-2 experiments, the paired pipeline is:
+
+```bash
+bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh
+```
+
+By default this from-scratch pipeline skips a separate final full evaluation and relies on the `full` run inside the ablation suite. Set `RUN_FINAL_FULL_EVAL=1` to restore the extra standalone full evaluation.

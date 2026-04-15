@@ -17,6 +17,7 @@ The active code path is built around:
 - [scripts/train_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/train_genrec_hybrid_diffusion.py)
 - [scripts/eval_genrec_hybrid_diffusion.py](/e:/RoboticsDiffusionTransformer/scripts/eval_genrec_hybrid_diffusion.py)
 - [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh)
+- [scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh](/e:/RoboticsDiffusionTransformer/scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh)
 
 ## Install
 
@@ -60,6 +61,12 @@ bash scripts/run_genrec_hybrid_diffusion_eval.sh
 bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh
 ```
 
+6. For current from-scratch stage-2 experiments with automatic post-training ablations, run:
+
+```bash
+bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh
+```
+
 ## Main Outputs
 
 - dense embeddings:
@@ -77,4 +84,5 @@ bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_30ep_pipeline.sh
 
 - `preprocess_amazon.py` is still part of the active pipeline because semantic-ID preparation depends on its split-aware buffer generation.
 - The evaluation script reports both overall retrieval metrics and grouped long-tail metrics on `cold`, `mid`, and `hot` items.
+- `scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh` now skips a separate final full evaluation by default and goes directly to the ablation suite, because the ablation suite already includes a `full` run. Set `RUN_FINAL_FULL_EVAL=1` if you want both.
 - [genrec/models/genrec_dit.py](/e:/RoboticsDiffusionTransformer/genrec/models/genrec_dit.py) is retained as the shared semantic-token backbone block used by the hybrid diffusion model, not as a separate maintained training pipeline.

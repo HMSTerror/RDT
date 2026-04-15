@@ -22,6 +22,7 @@ fi
 : "${TRAIN_LOG_PATH:=logs/genrec_stage2_fullmodal_fromscratch_train.log}"
 : "${FINAL_EVAL_LOG_DIR:=logs/genrec_stage2_fullmodal_fromscratch_eval}"
 : "${ABLATION_LOG_ROOT:=logs/genrec_stage2_fullmodal_fromscratch_ablation}"
+: "${RUN_FINAL_FULL_EVAL:=0}"
 
 mkdir -p "$(dirname "${TRAIN_LOG_PATH}")" "${FINAL_EVAL_LOG_DIR}" "${ABLATION_LOG_ROOT}"
 
@@ -32,6 +33,7 @@ echo "num_train_epochs   : ${NUM_TRAIN_EPOCHS}"
 echo "save_every_epochs  : ${SAVE_EVERY_EPOCHS}"
 echo "eval_every_epochs  : ${EVAL_EVERY_EPOCHS}"
 echo "train_log          : ${TRAIN_LOG_PATH}"
+echo "run_final_full_eval: ${RUN_FINAL_FULL_EVAL}"
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
@@ -59,12 +61,17 @@ if [[ ! -f "${FINAL_CHECKPOINT}/pytorch_model.bin" ]]; then
   fi
 fi
 
-echo "========== Final Full Evaluation =========="
-CHECKPOINT="${FINAL_CHECKPOINT}" \
-OUTPUT_DIR="${OUTPUT_DIR}" \
-CONFIG_PATH="${CONFIG_PATH}" \
-LOG_DIR="${FINAL_EVAL_LOG_DIR}" \
-bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_eval.sh
+if [[ "${RUN_FINAL_FULL_EVAL}" == "1" ]]; then
+  echo "========== Final Full Evaluation =========="
+  CHECKPOINT="${FINAL_CHECKPOINT}" \
+  OUTPUT_DIR="${OUTPUT_DIR}" \
+  CONFIG_PATH="${CONFIG_PATH}" \
+  LOG_DIR="${FINAL_EVAL_LOG_DIR}" \
+  bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_eval.sh
+else
+  echo "========== Skip Final Full Evaluation =========="
+  echo "Ablation suite already includes a full run; set RUN_FINAL_FULL_EVAL=1 to enable a separate final full eval."
+fi
 
 echo "========== Final Ablation Suite =========="
 CHECKPOINT="${FINAL_CHECKPOINT}" \
