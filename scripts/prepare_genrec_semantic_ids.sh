@@ -16,6 +16,7 @@ cd "${ROOT_DIR}"
 : "${TOKENIZED_ROOT:=data/Amazon_Music_And_Instruments/tokenized_semantic_ids}"
 : "${ITEM_MAP_PATH:=${BUFFER_ROOT}/train/item_map.json}"
 : "${QUANT_METHOD:=pq}"
+: "${ITEM_UNIVERSE_SPLIT:=train}"
 : "${CF_FIT_SPLIT:=train}"
 : "${CF_SPLIT_MODE:=leave_last_two}"
 : "${SEMANTIC_ID_FIT_SPLIT:=train}"
@@ -24,6 +25,8 @@ echo "========== [1/7] text embeddings =========="
 OUTPUT_PATH="${TEXT_EMBED_PATH}" \
 REVIEWS_PATH="${REVIEWS_PATH}" \
 META_PATH="${META_PATH}" \
+ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
+SPLIT_MODE=leave_last_two \
 bash scripts/generate_amazon_item_embeddings.sh
 
 if [[ "${ENABLE_IMAGE:-1}" == "1" ]]; then
@@ -32,6 +35,8 @@ if [[ "${ENABLE_IMAGE:-1}" == "1" ]]; then
   REVIEWS_PATH="${REVIEWS_PATH}" \
   META_PATH="${META_PATH}" \
   IMAGE_ROOT="${IMAGE_ROOT}" \
+  ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
+  SPLIT_MODE=leave_last_two \
   VISION_MODEL_NAME_OR_PATH="${VISION_MODEL_NAME_OR_PATH:-google/siglip-base-patch16-224}" \
   DEVICE="${IMAGE_DEVICE:-${DEVICE:-}}" \
   DTYPE="${IMAGE_DTYPE:-${DTYPE:-auto}}" \
@@ -49,6 +54,7 @@ if [[ "${ENABLE_CF:-0}" == "1" ]]; then
   OUTPUT_PATH="${CF_EMBED_PATH}" \
   REVIEWS_PATH="${REVIEWS_PATH}" \
   METHOD="${CF_METHOD:-item2vec}" \
+  ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
   FIT_SPLIT="${CF_FIT_SPLIT}" \
   SPLIT_MODE="${CF_SPLIT_MODE}" \
   WINDOW_SIZE="${CF_WINDOW_SIZE:-5}" \
@@ -70,6 +76,7 @@ EMBEDDING_PATH="${TEXT_EMBED_PATH}" \
 IMAGE_ROOT="${IMAGE_ROOT}" \
 OUTPUT_ROOT="${BUFFER_ROOT}" \
 SPLIT_MODE=leave_last_two \
+ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
 bash scripts/preprocess_amazon_minimal.sh
 
 INPUT_EMBED_PATH="${TEXT_EMBED_PATH}"

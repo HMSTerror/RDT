@@ -43,10 +43,13 @@ from preprocess_amazon import (  # noqa: E402
     K_CORE,
     apply_iterative_k_core,
     build_contiguous_mappings,
+    build_item_map_from_sequences,
+    build_user_sequences,
     clean_text,
     format_categories,
     iter_json_records,
     load_review_interactions,
+    select_item_universe_sequences,
 )
 
 
@@ -133,6 +136,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Random seed used by PCA.",
+    )
+    parser.add_argument(
+        "--item-universe-split",
+        type=str,
+        default="all",
+        choices=["all", "train"],
+        help=(
+            "Which temporal split defines the item ordering. "
+            "`train` uses only the leave-last-two train prefix items."
+        ),
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="leave_last_two",
+        choices=["none", "leave_last_two"],
+        help="Temporal split mode paired with --item-universe-split.",
     )
     return parser.parse_args()
 
@@ -342,6 +362,8 @@ def save_sidecar_metadata(
         "raw_encoder_dim": int(raw_dim),
         "num_items": int(num_items),
         "k_core": int(K_CORE),
+        "item_universe_split": args.item_universe_split,
+        "split_mode": args.split_mode,
         "embedding_type": "metadata_text_mean_pool_then_pca",
     }
     sidecar_path = output_path.with_suffix(".meta.json")
@@ -372,6 +394,8 @@ def main() -> None:
     print(f"device                : {device}")
     print(f"dtype                 : {dtype}")
     print(f"local_files_only      : {bool(args.local_files_only)}")
+    print(f"item_universe_split   : {args.item_universe_split}")
+    print(f"split_mode            : {args.split_mode}")
 
     interactions = load_review_interactions(args.reviews_path)
     if not interactions:
@@ -382,11 +406,23 @@ def main() -> None:
     if not filtered:
         raise RuntimeError("5-core filtering removed all interactions.")
 
-    _, item_map = build_contiguous_mappings(filtered)
+    user_map, _ = build_contiguous_mappings(filtered)
+    sequences = build_user_sequences(filtered, user_map)
+    universe_sequences = select_item_universe_sequences(
+        sequences,
+        item_universe_split=args.item_universe_split,
+        split_mode=args.split_mode,
+    )
+    item_map = build_item_map_from_sequences(universe_sequences)
+    if not item_map:
+        raise RuntimeError("The selected item universe is empty after temporal filtering.")
     ordered_item_ids = [
         item_id for item_id, _ in sorted(item_map.items(), key=lambda pair: pair[1])
     ]
-    print(f"[mapping] aligned items after {K_CORE}-core filtering: {len(ordered_item_ids)}")
+    print(
+        f"[mapping] aligned items after {K_CORE}-core filtering: {len(ordered_item_ids)} "
+        f"(item_universe_split={args.item_universe_split})"
+    )
 
     item_texts = load_item_texts(
         args.meta_path,

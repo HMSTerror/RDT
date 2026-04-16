@@ -19,6 +19,8 @@ cd "$ROOT_DIR"
 : "${DOWNLOAD_WORKERS:=16}"
 : "${DOWNLOAD_TIMEOUT:=10}"
 : "${ALLOW_ALL_MISSING_IMAGES:=0}"
+: "${ITEM_UNIVERSE_SPLIT:=all}"
+: "${SPLIT_MODE:=leave_last_two}"
 
 export PYTHONUNBUFFERED=1
 
@@ -33,6 +35,8 @@ args=(
   --output-dim "${OUTPUT_DIM}"
   --dtype "${DTYPE}"
   --seed "${SEED}"
+  --item-universe-split "${ITEM_UNIVERSE_SPLIT}"
+  --split-mode "${SPLIT_MODE}"
   --overwrite
 )
 

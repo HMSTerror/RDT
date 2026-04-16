@@ -66,6 +66,7 @@ IMAGE_SIZE = 224
 DATASET_NAME = "amazon_music"
 IMAGE_CACHE_SIZE = 256
 SPLIT_NAMES = ("train", "val", "test")
+SUPPORTED_ITEM_UNIVERSE_SPLITS = ("all", "train")
 
 try:
     RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
@@ -176,6 +177,18 @@ def parse_args() -> argparse.Namespace:
             "`leave_last_two` writes self-contained train/val/test buffers where "
             "each user's last target is test, the previous target is val, and all "
             "earlier targets are train. Use `none` to keep the legacy single-buffer layout."
+        ),
+    )
+    parser.add_argument(
+        "--item-universe-split",
+        type=str,
+        default="all",
+        choices=list(SUPPORTED_ITEM_UNIVERSE_SPLITS),
+        help=(
+            "Which temporal split defines the item universe and item_map. "
+            "`all` preserves the legacy behavior. "
+            "`train` builds the item universe from the train prefix only under "
+            "the chosen --split-mode, dropping val/test-only target items."
         ),
     )
     return parser.parse_args()
@@ -312,6 +325,29 @@ def build_user_sequences(
         events.sort(key=lambda pair: (pair[0], pair[1]))
         sequences[remapped_user_id] = [item_id for _, item_id in events]
     return sequences
+
+
+def select_item_universe_sequences(
+    sequences: Dict[int, List[str]],
+    *,
+    item_universe_split: str,
+    split_mode: str,
+) -> Dict[int, List[str]]:
+    if item_universe_split == "all" or split_mode == "none":
+        return {user_id: list(sequence) for user_id, sequence in sequences.items()}
+
+    selected: Dict[int, List[str]] = {}
+    for user_id, sequence in sequences.items():
+        if split_mode == "leave_last_two":
+            selected[user_id] = list(sequence[:-2]) if len(sequence) >= 3 else []
+        else:
+            raise ValueError(f"Unsupported split_mode={split_mode!r}.")
+    return selected
+
+
+def build_item_map_from_sequences(sequences: Dict[int, List[str]]) -> Dict[str, int]:
+    item_ids = sorted({item_id for sequence in sequences.values() for item_id in sequence})
+    return {item_id: idx for idx, item_id in enumerate(item_ids)}
 
 
 def load_item_meta(meta_path: Path, target_items: Sequence[str]) -> Dict[str, dict]:
@@ -547,6 +583,8 @@ def build_lightweight_sample(
     history_mask = np.zeros((history_len,), dtype=np.uint8)
 
     for offset, item_id in enumerate(history_items):
+        if item_id not in item_map:
+            continue
         dst = left_pad + offset
         history_item_ids[dst] = item_map[item_id]
         history_mask[dst] = 1
@@ -596,25 +634,37 @@ def get_target_split(sequence_len: int, target_pos: int, split_mode: str) -> str
     return "train"
 
 
-def count_sequence_samples_by_split(sequence_len: int, split_mode: str) -> Dict[str, int]:
-    total = max(sequence_len - 1, 0)
-    if split_mode == "none":
-        return {"train": total}
-    return {
-        "train": max(sequence_len - 3, 0),
-        "val": 1 if sequence_len >= 3 else 0,
-        "test": 1 if sequence_len >= 2 else 0,
-    }
+def count_sequence_samples_by_split(
+    sequence: Sequence[str],
+    split_mode: str,
+    *,
+    known_items: Optional[set[str]] = None,
+) -> Dict[str, int]:
+    split_names = ["train"] if split_mode == "none" else list(SPLIT_NAMES)
+    counts = {split_name: 0 for split_name in split_names}
+    sequence_len = len(sequence)
+    for target_pos in range(1, sequence_len):
+        if known_items is not None and sequence[target_pos] not in known_items:
+            continue
+        split_name = get_target_split(sequence_len, target_pos, split_mode)
+        counts[split_name] += 1
+    return counts
 
 
 def aggregate_split_counts(
     sequences: Dict[int, List[str]],
     split_mode: str,
+    *,
+    known_items: Optional[set[str]] = None,
 ) -> Dict[str, int]:
     split_names = ["train"] if split_mode == "none" else list(SPLIT_NAMES)
     counts = {split: 0 for split in split_names}
     for sequence in sequences.values():
-        for split_name, count in count_sequence_samples_by_split(len(sequence), split_mode).items():
+        for split_name, count in count_sequence_samples_by_split(
+            sequence,
+            split_mode,
+            known_items=known_items,
+        ).items():
             counts[split_name] += count
     return counts
 
@@ -656,6 +706,7 @@ def build_stats_payload(
         "history_len": args.history_len,
         "chunk_size": args.chunk_size,
         "k_core": K_CORE,
+        "item_universe_split": args.item_universe_split,
         "num_users": len(user_map),
         "num_items": len(item_map),
         "num_sequences": len(sequences),
@@ -725,6 +776,7 @@ def main() -> None:
     print(f"output_root  : {args.output_root}")
     print(f"history_len  : {args.history_len}")
     print(f"chunk_size   : {args.chunk_size}")
+    print(f"item_universe: {args.item_universe_split}")
 
     interactions = load_review_interactions(args.reviews_path)
     if not interactions:
@@ -737,15 +789,36 @@ def main() -> None:
     del interactions
     gc.collect()
 
-    user_map, item_map = build_contiguous_mappings(filtered)
-    print(f"[mapping] users={len(user_map)} items={len(item_map)} interactions={len(filtered)}")
+    user_map, _ = build_contiguous_mappings(filtered)
 
     sequences = build_user_sequences(filtered, user_map)
     del filtered
     gc.collect()
 
+    universe_sequences = select_item_universe_sequences(
+        sequences,
+        item_universe_split=args.item_universe_split,
+        split_mode=args.split_mode,
+    )
+    item_map = build_item_map_from_sequences(universe_sequences)
+    if not item_map:
+        raise RuntimeError(
+            "The selected item universe is empty. "
+            "Try using --item-universe-split=all or check the current split settings."
+        )
+    print(
+        f"[mapping] users={len(user_map)} items={len(item_map)} "
+        f"item_universe_split={args.item_universe_split}"
+    )
+
     split_names = ["train"] if args.split_mode == "none" else list(SPLIT_NAMES)
-    split_raw_counts = aggregate_split_counts(sequences, args.split_mode)
+    known_items = set(item_map.keys())
+    split_raw_counts_all = aggregate_split_counts(sequences, args.split_mode)
+    split_raw_counts = aggregate_split_counts(
+        sequences,
+        args.split_mode,
+        known_items=known_items,
+    )
     split_write_plans = {
         split_name: build_split_write_plan(
             split_raw_counts[split_name],
@@ -773,11 +846,13 @@ def main() -> None:
     )
     for split_name in split_names:
         plan = split_write_plans[split_name]
+        dropped_unknown_targets = split_raw_counts_all[split_name] - split_raw_counts[split_name]
         print(
             f"[split:{split_name}] total={plan['raw_count']} "
             f"write={plan['samples_to_write']} "
             f"drop_tail={plan['dropped_tail']} "
-            f"chunks={plan['full_chunks']}"
+            f"chunks={plan['full_chunks']} "
+            f"dropped_unknown_targets={dropped_unknown_targets}"
         )
     print(f"[disk]    approx lightweight index payload={approx_gib:.4f} GiB")
 
@@ -873,6 +948,8 @@ def main() -> None:
             split_name = get_target_split(len(sequence), target_pos, args.split_mode)
             split_plan = split_write_plans[split_name]
             if written_by_split[split_name] >= split_plan["samples_to_write"]:
+                continue
+            if sequence[target_pos] not in item_map:
                 continue
 
             sample_record = build_lightweight_sample(

@@ -15,6 +15,7 @@ cd "$ROOT_DIR"
 : "${DOWNLOAD_TIMEOUT:=10}"
 : "${SEED:=0}"
 : "${SPLIT_MODE:=leave_last_two}"
+: "${ITEM_UNIVERSE_SPLIT:=all}"
 
 export PYTHONUNBUFFERED=1
 
@@ -30,5 +31,6 @@ python preprocess_amazon.py \
   --download-timeout "${DOWNLOAD_TIMEOUT}" \
   --seed "${SEED}" \
   --split-mode "${SPLIT_MODE}" \
+  --item-universe-split "${ITEM_UNIVERSE_SPLIT}" \
   --overwrite \
   "$@"

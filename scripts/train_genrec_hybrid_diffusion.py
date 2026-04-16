@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from tqdm.auto import tqdm
 from transformers.optimization import get_scheduler
 
@@ -129,6 +129,26 @@ def make_dataloader(
         pin_memory=torch.cuda.is_available(),
         collate_fn=GenRecTokenizedCollator(),
     )
+
+
+def maybe_build_fixed_eval_subset(
+    dataset: GenRecTokenizedDataset | None,
+    *,
+    subset_size: int | None,
+    subset_offset: int,
+) -> GenRecTokenizedDataset | Subset | None:
+    if dataset is None or subset_size is None:
+        return dataset
+    if subset_size <= 0:
+        return dataset
+
+    start = max(0, int(subset_offset))
+    end = min(len(dataset), start + int(subset_size))
+    if start >= len(dataset) or start >= end:
+        raise ValueError(
+            f"Invalid validation subset range: start={start}, end={end}, dataset_size={len(dataset)}."
+        )
+    return Subset(dataset, list(range(start, end)))
 
 
 def maybe_print(accelerator: Accelerator, message: str) -> None:
@@ -394,6 +414,45 @@ def save_checkpoint(
         json.dump(run_manifest, fp, indent=2, ensure_ascii=False)
 
 
+def save_best_snapshot(
+    *,
+    accelerator: Accelerator,
+    model: GenRecHybridDiffusionRunner,
+    output_dir: Path,
+    run_manifest: dict,
+    step: int,
+    epoch: float,
+    metrics: dict[str, float],
+) -> Path:
+    accelerator.wait_for_everyone()
+    best_dir = output_dir / "best"
+    if accelerator.is_main_process:
+        best_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(accelerator.unwrap_model(model).state_dict(), best_dir / "pytorch_model.bin")
+        payload = dict(run_manifest)
+        payload["best_step"] = int(step)
+        payload["best_epoch"] = float(epoch)
+        payload["best_metrics"] = {key: float(value) for key, value in metrics.items()}
+        with open(best_dir / "run_manifest.json", "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2, ensure_ascii=False)
+    accelerator.wait_for_everyone()
+    return best_dir
+
+
+def is_metric_improved(
+    *,
+    current: float,
+    best: float | None,
+    mode: str,
+    min_delta: float,
+) -> bool:
+    if best is None:
+        return True
+    if mode == "max":
+        return current > (best + min_delta)
+    return current < (best - min_delta)
+
+
 def infer_step_from_checkpoint_dir(path: Path) -> int | None:
     match = re.search(r"checkpoint-(\d+)", path.name)
     if match:
@@ -608,6 +667,20 @@ def main() -> None:
     ranking_reweight_power = float(ranking_reweight_cfg.get("power", 0.5))
     ranking_reweight_min_weight = float(ranking_reweight_cfg.get("min_weight", 0.5))
     ranking_reweight_max_weight = float(ranking_reweight_cfg.get("max_weight", 3.0))
+    val_subset_size_cfg = training_cfg.get("val_subset_size")
+    val_subset_size = int(val_subset_size_cfg) if val_subset_size_cfg not in (None, 0) else None
+    val_subset_offset = int(training_cfg.get("val_subset_offset", 0))
+    run_train_final_eval = bool(training_cfg.get("run_train_final_eval", True))
+    early_stopping_cfg = training_cfg.get("early_stopping", {})
+    early_stopping_enabled = bool(early_stopping_cfg.get("enabled", False))
+    early_stopping_metric = str(early_stopping_cfg.get("metric", "loss"))
+    early_stopping_mode = str(early_stopping_cfg.get("mode", "min")).lower()
+    if early_stopping_mode not in {"min", "max"}:
+        raise ValueError(f"Unsupported early stopping mode: {early_stopping_mode}")
+    early_stopping_patience = int(early_stopping_cfg.get("patience", 3))
+    early_stopping_min_delta = float(early_stopping_cfg.get("min_delta", 0.0))
+    early_stopping_warmup_epochs = int(early_stopping_cfg.get("warmup_epochs", 0))
+    save_best_snapshot_enabled = bool(early_stopping_cfg.get("save_best_snapshot", True))
     use_popularity = bool(conditioning_cfg.get("use_popularity", False))
     popularity_num_buckets = int(conditioning_cfg.get("popularity_num_buckets", 16))
     popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
@@ -665,6 +738,11 @@ def main() -> None:
     )
     valid_loader = None
     if valid_dataset is not None:
+        valid_dataset = maybe_build_fixed_eval_subset(
+            valid_dataset,
+            subset_size=val_subset_size,
+            subset_offset=val_subset_offset,
+        )
         valid_loader = make_dataloader(
             valid_dataset,
             batch_size=eval_batch_size,
@@ -763,6 +841,8 @@ def main() -> None:
         "tokenized_root": str(tokenized_root),
         "train_split": train_split,
         "valid_split": valid_split if valid_dataset is not None else None,
+        "train_num_samples": int(len(train_dataset)),
+        "valid_num_samples": int(len(valid_dataset)) if valid_dataset is not None else None,
         "target_latent_path": str(target_latent_path),
         "latent_dim": latent_dim,
         "normalize_target_latent": normalize_target_latent,
@@ -796,6 +876,18 @@ def main() -> None:
         "save_steps": int(save_steps) if save_steps else None,
         "eval_every_epochs": int(eval_every_epochs) if eval_every_epochs else None,
         "save_every_epochs": int(save_every_epochs) if save_every_epochs else None,
+        "val_subset_size": int(val_subset_size) if val_subset_size is not None else None,
+        "val_subset_offset": int(val_subset_offset),
+        "run_train_final_eval": run_train_final_eval,
+        "early_stopping": {
+            "enabled": early_stopping_enabled,
+            "metric": early_stopping_metric,
+            "mode": early_stopping_mode,
+            "patience": early_stopping_patience,
+            "min_delta": early_stopping_min_delta,
+            "warmup_epochs": early_stopping_warmup_epochs,
+            "save_best_snapshot": save_best_snapshot_enabled,
+        },
         "tail_sampler": {
             "enabled": tail_sampler_enabled,
             "power": tail_sampler_power,
@@ -822,6 +914,21 @@ def main() -> None:
     accelerator.wait_for_everyone()
     metrics_history_records: list[dict] = []
 
+    if early_stopping_enabled and valid_loader is None:
+        maybe_print(
+            accelerator,
+            "[warn] early stopping is enabled but no validation split was found; disabling early stopping.",
+        )
+        early_stopping_enabled = False
+
+    best_val_metric: float | None = None
+    best_val_metrics: dict[str, float] = {}
+    best_val_step: int | None = None
+    best_val_epoch: float | None = None
+    no_improvement_evals = 0
+    stop_training_early = False
+    early_stop_reason: str | None = None
+
     global_step = 0
     if args.load_model_only_from_checkpoint is not None:
         load_model_only_from_checkpoint(
@@ -837,6 +944,64 @@ def main() -> None:
             lr_scheduler=lr_scheduler,
             checkpoint_dir=args.resume_from_checkpoint,
         )
+
+    def handle_validation_result(metrics: dict[str, float], *, epoch_value: float, scope: str) -> None:
+        nonlocal best_val_metric, best_val_metrics, best_val_step, best_val_epoch
+        nonlocal no_improvement_evals, stop_training_early, early_stop_reason
+
+        if not early_stopping_enabled:
+            return
+        if early_stopping_metric not in metrics:
+            maybe_print(
+                accelerator,
+                f"[warn] early stopping metric `{early_stopping_metric}` not found in validation metrics; skipping update.",
+            )
+            return
+        if epoch_value < float(early_stopping_warmup_epochs):
+            return
+
+        current_metric = float(metrics[early_stopping_metric])
+        improved = is_metric_improved(
+            current=current_metric,
+            best=best_val_metric,
+            mode=early_stopping_mode,
+            min_delta=early_stopping_min_delta,
+        )
+        if improved:
+            best_val_metric = current_metric
+            best_val_metrics = {key: float(value) for key, value in metrics.items()}
+            best_val_step = int(global_step)
+            best_val_epoch = float(epoch_value)
+            no_improvement_evals = 0
+            if save_best_snapshot_enabled:
+                save_best_snapshot(
+                    accelerator=accelerator,
+                    model=model,
+                    output_dir=output_dir,
+                    run_manifest=run_manifest,
+                    step=global_step,
+                    epoch=epoch_value,
+                    metrics=best_val_metrics,
+                )
+            maybe_print(
+                accelerator,
+                f"[early-stop] new best {early_stopping_metric}={current_metric:.6f} "
+                f"at step={global_step} epoch={epoch_value:.3f} scope={scope}",
+            )
+            return
+
+        no_improvement_evals += 1
+        maybe_print(
+            accelerator,
+            f"[early-stop] no improvement on {early_stopping_metric} "
+            f"(current={current_metric:.6f}, best={best_val_metric:.6f}) "
+            f"count={no_improvement_evals}/{early_stopping_patience}",
+        )
+        if no_improvement_evals >= early_stopping_patience:
+            stop_training_early = True
+            early_stop_reason = (
+                f"patience reached on {early_stopping_metric} after {no_improvement_evals} validation checks"
+            )
 
     progress_bar = tqdm(
         total=max_train_steps,
@@ -959,6 +1124,13 @@ def main() -> None:
                         }
                         metrics_history_records.append(history_record)
                         append_metrics_history(metrics_history_path, history_record)
+                    handle_validation_result(
+                        metrics,
+                        epoch_value=float(epoch_idx + 1),
+                        scope="step",
+                    )
+                    if stop_training_early:
+                        break
 
             if save_steps and global_step % int(save_steps) == 0:
                 save_checkpoint(
@@ -972,6 +1144,8 @@ def main() -> None:
                 )
 
             if global_step >= max_train_steps:
+                break
+            if stop_training_early:
                 break
 
         completed_epoch = epoch_idx + 1
@@ -1040,6 +1214,11 @@ def main() -> None:
                     }
                     metrics_history_records.append(history_record)
                     append_metrics_history(metrics_history_path, history_record)
+                handle_validation_result(
+                    metrics,
+                    epoch_value=float(completed_epoch),
+                    scope="epoch",
+                )
 
         if save_every_epochs and completed_epoch % int(save_every_epochs) == 0:
             save_checkpoint(
@@ -1054,9 +1233,15 @@ def main() -> None:
 
         if global_step >= max_train_steps:
             break
+        if stop_training_early:
+            maybe_print(
+                accelerator,
+                f"[early-stop] stopping training after epoch {completed_epoch}: {early_stop_reason}",
+            )
+            break
 
     final_metrics = {}
-    if valid_loader is not None:
+    if valid_loader is not None and run_train_final_eval:
         final_metrics = evaluate(
             accelerator=accelerator,
             model=model,
@@ -1083,6 +1268,8 @@ def main() -> None:
                 }
                 metrics_history_records.append(history_record)
                 append_metrics_history(metrics_history_path, history_record)
+    elif valid_loader is not None:
+        maybe_print(accelerator, "[final eval] skipped by configuration")
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1097,6 +1284,12 @@ def main() -> None:
         with open(final_dir / "run_manifest.json", "w", encoding="utf-8") as fp:
             payload = dict(run_manifest)
             payload["final_metrics"] = final_metrics
+            payload["best_val_metric"] = best_val_metric
+            payload["best_val_metrics"] = best_val_metrics
+            payload["best_val_step"] = best_val_step
+            payload["best_val_epoch"] = best_val_epoch
+            payload["stopped_early"] = stop_training_early
+            payload["early_stop_reason"] = early_stop_reason
             payload["metrics_history_path"] = str(metrics_history_path)
             payload["loss_curve_path"] = str(saved_curve_path) if saved_curve_path is not None else None
             json.dump(payload, fp, indent=2, ensure_ascii=False)

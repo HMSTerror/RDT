@@ -40,13 +40,16 @@ from preprocess_amazon import (  # noqa: E402
     K_CORE,
     apply_iterative_k_core,
     build_contiguous_mappings,
+    build_item_map_from_sequences,
     build_user_sequences,
     load_review_interactions,
+    select_item_universe_sequences,
 )
 
 
 SUPPORTED_METHODS = ("item_item_sppmi", "item2vec", "mf_bpr")
 SUPPORTED_FIT_SPLITS = ("all", "train")
+SUPPORTED_ITEM_UNIVERSE_SPLITS = ("all", "train")
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +165,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite an existing output file if it already exists.",
     )
+    parser.add_argument(
+        "--item-universe-split",
+        type=str,
+        default="all",
+        choices=list(SUPPORTED_ITEM_UNIVERSE_SPLITS),
+        help=(
+            "Which temporal split defines the output item universe. "
+            "`train` restricts the embedding rows to train-prefix items only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -180,7 +193,10 @@ def set_seed(seed: int) -> None:
 
 def build_aligned_sequences(
     reviews_path: Path,
-) -> tuple[List[Tuple[str, str, int]], Dict[str, int], Dict[str, int], Dict[int, List[str]], List[str]]:
+    *,
+    item_universe_split: str,
+    split_mode: str,
+) -> tuple[Dict[str, int], Dict[str, int], Dict[int, List[str]], List[str]]:
     interactions = load_review_interactions(reviews_path)
     if not interactions:
         raise RuntimeError("No valid interactions were found in the review file.")
@@ -190,16 +206,24 @@ def build_aligned_sequences(
     if not filtered:
         raise RuntimeError("5-core filtering removed all interactions.")
 
-    user_map, item_map = build_contiguous_mappings(filtered)
+    user_map, _ = build_contiguous_mappings(filtered)
     sequences = build_user_sequences(filtered, user_map)
+    universe_sequences = select_item_universe_sequences(
+        sequences,
+        item_universe_split=item_universe_split,
+        split_mode=split_mode,
+    )
+    item_map = build_item_map_from_sequences(universe_sequences)
+    if not item_map:
+        raise RuntimeError("The selected item universe is empty after temporal filtering.")
     ordered_item_ids = [
         item_id for item_id, _ in sorted(item_map.items(), key=lambda pair: pair[1])
     ]
     print(
         f"[mapping] aligned users={len(user_map)} items={len(item_map)} "
-        f"sequences={len(sequences)}"
+        f"sequences={len(sequences)} item_universe_split={item_universe_split}"
     )
-    return filtered, user_map, item_map, sequences, ordered_item_ids
+    return user_map, item_map, sequences, ordered_item_ids
 
 
 def convert_sequences_to_indices(
@@ -234,12 +258,15 @@ def build_interactions_from_sequences(
     sequences: Dict[int, List[str]],
     *,
     user_map: Dict[str, int],
+    item_map: Dict[str, int],
 ) -> List[Tuple[str, str, int]]:
     idx_to_user = {idx: user_id for user_id, idx in user_map.items()}
     interactions: List[Tuple[str, str, int]] = []
     for user_idx, sequence in sequences.items():
         user_id = idx_to_user[user_idx]
         for position, item_id in enumerate(sequence):
+            if item_id not in item_map:
+                continue
             interactions.append((user_id, item_id, position))
     return interactions
 
@@ -555,6 +582,7 @@ def save_sidecar_metadata(
         "method": args.method,
         "fit_split": args.fit_split,
         "split_mode": args.split_mode,
+        "item_universe_split": args.item_universe_split,
         "output_dim": int(args.output_dim),
         "window_size": int(args.window_size),
         "negative_samples": int(args.negative_samples),
@@ -599,8 +627,13 @@ def main() -> None:
     print(f"learning_rate         : {args.learning_rate}")
     print(f"fit_split             : {args.fit_split}")
     print(f"split_mode            : {args.split_mode}")
+    print(f"item_universe_split   : {args.item_universe_split}")
 
-    filtered, user_map, item_map, sequences, _ = build_aligned_sequences(args.reviews_path)
+    user_map, item_map, sequences, _ = build_aligned_sequences(
+        args.reviews_path,
+        item_universe_split=args.item_universe_split,
+        split_mode=args.split_mode,
+    )
     fit_sequences = select_fit_sequences(
         sequences,
         fit_split=args.fit_split,
@@ -610,6 +643,7 @@ def main() -> None:
     fit_interactions = build_interactions_from_sequences(
         fit_sequences,
         user_map=user_map,
+        item_map=item_map,
     )
 
     non_empty_fit_sequences = sum(1 for sequence in fit_sequences.values() if sequence)

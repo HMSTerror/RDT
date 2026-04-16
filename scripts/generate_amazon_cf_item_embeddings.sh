@@ -19,6 +19,7 @@ cd "$ROOT_DIR"
 : "${SEED:=0}"
 : "${FIT_SPLIT:=all}"
 : "${SPLIT_MODE:=leave_last_two}"
+: "${ITEM_UNIVERSE_SPLIT:=all}"
 
 export PYTHONUNBUFFERED=1
 
@@ -37,6 +38,7 @@ args=(
   --sppmi-shift "${SPPMI_SHIFT}"
   --fit-split "${FIT_SPLIT}"
   --split-mode "${SPLIT_MODE}"
+  --item-universe-split "${ITEM_UNIVERSE_SPLIT}"
   --seed "${SEED}"
   --overwrite
 )

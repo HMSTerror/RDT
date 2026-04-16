@@ -43,7 +43,10 @@ from preprocess_amazon import (  # noqa: E402
     K_CORE,
     apply_iterative_k_core,
     build_contiguous_mappings,
+    build_item_map_from_sequences,
+    build_user_sequences,
     load_review_interactions,
+    select_item_universe_sequences,
 )
 
 
@@ -204,6 +207,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow output even when all items are missing images.",
     )
+    parser.add_argument(
+        "--item-universe-split",
+        type=str,
+        default="all",
+        choices=["all", "train"],
+        help=(
+            "Which temporal split defines the aligned item ordering. "
+            "`train` uses only the leave-last-two train prefix items."
+        ),
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="leave_last_two",
+        choices=["none", "leave_last_two"],
+        help="Temporal split mode paired with --item-universe-split.",
+    )
     return parser.parse_args()
 
 
@@ -252,7 +272,12 @@ def reduce_to_target_dim(embeddings: torch.Tensor, output_dim: int, seed: int) -
     return F.normalize(reduced, dim=-1)
 
 
-def build_aligned_item_ids(reviews_path: Path) -> List[str]:
+def build_aligned_item_ids(
+    reviews_path: Path,
+    *,
+    item_universe_split: str,
+    split_mode: str,
+) -> List[str]:
     interactions = load_review_interactions(reviews_path)
     if not interactions:
         raise RuntimeError("No valid interactions were found in the review file.")
@@ -262,9 +287,21 @@ def build_aligned_item_ids(reviews_path: Path) -> List[str]:
     if not filtered:
         raise RuntimeError("5-core filtering removed all interactions.")
 
-    _, item_map = build_contiguous_mappings(filtered)
+    user_map, _ = build_contiguous_mappings(filtered)
+    sequences = build_user_sequences(filtered, user_map)
+    universe_sequences = select_item_universe_sequences(
+        sequences,
+        item_universe_split=item_universe_split,
+        split_mode=split_mode,
+    )
+    item_map = build_item_map_from_sequences(universe_sequences)
+    if not item_map:
+        raise RuntimeError("The selected item universe is empty after temporal filtering.")
     ordered_item_ids = [item_id for item_id, _ in sorted(item_map.items(), key=lambda pair: pair[1])]
-    print(f"[mapping] aligned items after 5-core filtering: {len(ordered_item_ids)}")
+    print(
+        f"[mapping] aligned items after 5-core filtering: {len(ordered_item_ids)} "
+        f"(item_universe_split={item_universe_split})"
+    )
     return ordered_item_ids
 
 
@@ -540,7 +577,14 @@ def main() -> None:
     dtype = resolve_dtype(args.dtype, device)
     args.image_root.mkdir(parents=True, exist_ok=True)
 
-    ordered_item_ids = build_aligned_item_ids(args.reviews_path)
+    print(f"item_universe_split    : {args.item_universe_split}")
+    print(f"split_mode             : {args.split_mode}")
+
+    ordered_item_ids = build_aligned_item_ids(
+        args.reviews_path,
+        item_universe_split=args.item_universe_split,
+        split_mode=args.split_mode,
+    )
     meta_lookup = load_meta_image_lookup(args.meta_path, ordered_item_ids)
     index_by_name, index_by_stem, indexed_files = build_recursive_image_index(args.image_root)
     print(
@@ -607,6 +651,8 @@ def main() -> None:
         "dtype": str(dtype),
         "local_files_only": bool(args.local_files_only),
         "download_missing": bool(args.download_missing),
+        "item_universe_split": args.item_universe_split,
+        "split_mode": args.split_mode,
     }
     with open(sidecar_path, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, indent=2, ensure_ascii=False)

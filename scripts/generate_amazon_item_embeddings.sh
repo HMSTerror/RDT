@@ -15,6 +15,8 @@ cd "$ROOT_DIR"
 : "${DTYPE:=auto}"
 : "${SEED:=0}"
 : "${LOCAL_FILES_ONLY:=0}"
+: "${ITEM_UNIVERSE_SPLIT:=all}"
+: "${SPLIT_MODE:=leave_last_two}"
 
 export PYTHONUNBUFFERED=1
 
@@ -29,6 +31,8 @@ args=(
   --output-dim "${OUTPUT_DIM}"
   --dtype "${DTYPE}"
   --seed "${SEED}"
+  --item-universe-split "${ITEM_UNIVERSE_SPLIT}"
+  --split-mode "${SPLIT_MODE}"
   --overwrite
 )
 
