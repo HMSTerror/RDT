@@ -100,9 +100,20 @@ training:
   lr_scheduler: cosine
   warmup_steps: 500
   eval_steps:
-  save_steps:
-  eval_every_epochs: 10
-  save_every_epochs: 10
+  save_steps: 0
+  eval_every_epochs: 1
+  save_every_epochs: 0
+  run_train_final_eval: true
+  val_subset_size: 2048
+  val_subset_offset: 0
+  early_stopping:
+    enabled: true
+    metric: loss
+    mode: min
+    patience: 3
+    min_delta: 0.0005
+    warmup_epochs: 3
+    save_best_snapshot: true
   diffusion_loss_weight: 1.0
   ranking_loss_weight: 0.1
   ranking_temperature: 0.07
