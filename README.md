@@ -41,6 +41,10 @@ bash scripts/download_amazon_music_dataset.sh
 TEXT_MODEL_NAME_OR_PATH=/path/to/t5 \
 VISION_MODEL_NAME_OR_PATH=/path/to/siglip \
 bash scripts/prepare_genrec_semantic_ids.sh
+
+# strict protocol defaults in v1.3:
+# - CF embeddings fit on the train prefix only
+# - semantic ID quantizer fits on train-seen items only, then encodes all items
 ```
 
 3. Train the baseline hybrid diffusion model:
@@ -83,6 +87,7 @@ bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.s
 ## Notes
 
 - `preprocess_amazon.py` is still part of the active pipeline because semantic-ID preparation depends on its split-aware buffer generation.
+- `scripts/prepare_genrec_semantic_ids.sh` now defaults to a stricter protocol for behavior-derived features: `CF_FIT_SPLIT=train` and `SEMANTIC_ID_FIT_SPLIT=train`. Set either variable to `all` if you explicitly want the older all-item fitting behavior.
 - The evaluation script reports both overall retrieval metrics and grouped long-tail metrics on `cold`, `mid`, and `hot` items.
 - `scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.sh` now skips a separate final full evaluation by default and goes directly to the ablation suite, because the ablation suite already includes a `full` run. Set `RUN_FINAL_FULL_EVAL=1` if you want both.
 - Stage-2 eval and ablation wrappers now support distributed `accelerate launch`. On a dual-GPU server you can set `NUM_PROCESSES=2 MIXED_PRECISION=bf16` so the final full eval and ablation runs use both cards instead of a single process.

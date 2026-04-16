@@ -16,6 +16,9 @@ cd "${ROOT_DIR}"
 : "${TOKENIZED_ROOT:=data/Amazon_Music_And_Instruments/tokenized_semantic_ids}"
 : "${ITEM_MAP_PATH:=${BUFFER_ROOT}/train/item_map.json}"
 : "${QUANT_METHOD:=pq}"
+: "${CF_FIT_SPLIT:=train}"
+: "${CF_SPLIT_MODE:=leave_last_two}"
+: "${SEMANTIC_ID_FIT_SPLIT:=train}"
 
 echo "========== [1/7] text embeddings =========="
 OUTPUT_PATH="${TEXT_EMBED_PATH}" \
@@ -46,6 +49,8 @@ if [[ "${ENABLE_CF:-0}" == "1" ]]; then
   OUTPUT_PATH="${CF_EMBED_PATH}" \
   REVIEWS_PATH="${REVIEWS_PATH}" \
   METHOD="${CF_METHOD:-item2vec}" \
+  FIT_SPLIT="${CF_FIT_SPLIT}" \
+  SPLIT_MODE="${CF_SPLIT_MODE}" \
   WINDOW_SIZE="${CF_WINDOW_SIZE:-5}" \
   NEGATIVE_SAMPLES="${CF_NEGATIVE_SAMPLES:-10}" \
   EPOCHS="${CF_EPOCHS:-5}" \
@@ -92,17 +97,26 @@ else
 fi
 
 echo "========== [6/7] semantic ID quantization =========="
-python scripts/build_semantic_ids.py \
-  --embeddings-path "${INPUT_EMBED_PATH}" \
-  --item-map-path "${ITEM_MAP_PATH}" \
-  --output-root "${SEMANTIC_ID_ROOT}" \
-  --method "${QUANT_METHOD}" \
-  --num-subspaces "${NUM_SUBSPACES:-4}" \
-  --codebook-size "${CODEBOOK_SIZE:-256}" \
-  --levels "${RKMEANS_LEVELS:-4}" \
-  --branching-factor "${RKMEANS_BRANCHING_FACTOR:-16}" \
-  --max-iter "${MAX_ITER:-25}" \
+semantic_id_args=(
+  scripts/build_semantic_ids.py
+  --embeddings-path "${INPUT_EMBED_PATH}"
+  --item-map-path "${ITEM_MAP_PATH}"
+  --output-root "${SEMANTIC_ID_ROOT}"
+  --method "${QUANT_METHOD}"
+  --num-subspaces "${NUM_SUBSPACES:-4}"
+  --codebook-size "${CODEBOOK_SIZE:-256}"
+  --levels "${RKMEANS_LEVELS:-4}"
+  --branching-factor "${RKMEANS_BRANCHING_FACTOR:-16}"
+  --max-iter "${MAX_ITER:-25}"
   --seed "${SEED:-0}"
+)
+if [[ "${SEMANTIC_ID_FIT_SPLIT}" != "all" ]]; then
+  semantic_id_args+=(
+    --fit-buffer-root "${BUFFER_ROOT}"
+    --fit-buffer-split "${SEMANTIC_ID_FIT_SPLIT}"
+  )
+fi
+python "${semantic_id_args[@]}"
 
 echo "========== [7/7] tokenized samples =========="
 python scripts/build_tokenized_samples.py \

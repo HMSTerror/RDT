@@ -46,6 +46,7 @@ from preprocess_amazon import (  # noqa: E402
 
 
 SUPPORTED_METHODS = ("item_item_sppmi", "item2vec", "mf_bpr")
+SUPPORTED_FIT_SPLITS = ("all", "train")
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +136,28 @@ def parse_args() -> argparse.Namespace:
         help="Random seed.",
     )
     parser.add_argument(
+        "--fit-split",
+        type=str,
+        default="all",
+        choices=list(SUPPORTED_FIT_SPLITS),
+        help=(
+            "Which temporal split to use when fitting CF embeddings. "
+            "`all` uses the full interaction sequence. "
+            "`train` mirrors preprocess_amazon.py leave-last-two logic by "
+            "dropping each user's last two interactions before fitting."
+        ),
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="leave_last_two",
+        choices=["none", "leave_last_two"],
+        help=(
+            "Temporal split mode paired with --fit-split=train. "
+            "`leave_last_two` keeps only the train prefix of each user sequence."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite an existing output file if it already exists.",
@@ -187,6 +210,38 @@ def convert_sequences_to_indices(
     for sequence in sequences.values():
         indexed_sequences.append([item_map[item_id] for item_id in sequence if item_id in item_map])
     return indexed_sequences
+
+
+def select_fit_sequences(
+    sequences: Dict[int, List[str]],
+    *,
+    fit_split: str,
+    split_mode: str,
+) -> Dict[int, List[str]]:
+    if fit_split == "all" or split_mode == "none":
+        return {user_idx: list(sequence) for user_idx, sequence in sequences.items()}
+
+    selected: Dict[int, List[str]] = {}
+    for user_idx, sequence in sequences.items():
+        if split_mode == "leave_last_two":
+            selected[user_idx] = list(sequence[:-2]) if len(sequence) >= 3 else []
+        else:
+            raise ValueError(f"Unsupported split_mode={split_mode!r}.")
+    return selected
+
+
+def build_interactions_from_sequences(
+    sequences: Dict[int, List[str]],
+    *,
+    user_map: Dict[str, int],
+) -> List[Tuple[str, str, int]]:
+    idx_to_user = {idx: user_id for user_id, idx in user_map.items()}
+    interactions: List[Tuple[str, str, int]] = []
+    for user_idx, sequence in sequences.items():
+        user_id = idx_to_user[user_idx]
+        for position, item_id in enumerate(sequence):
+            interactions.append((user_id, item_id, position))
+    return interactions
 
 
 def reduce_to_target_dim(embeddings: torch.Tensor, output_dim: int, seed: int) -> torch.Tensor:
@@ -498,6 +553,8 @@ def save_sidecar_metadata(
         "reviews_path": str(args.reviews_path),
         "output_path": str(output_path),
         "method": args.method,
+        "fit_split": args.fit_split,
+        "split_mode": args.split_mode,
         "output_dim": int(args.output_dim),
         "window_size": int(args.window_size),
         "negative_samples": int(args.negative_samples),
@@ -540,9 +597,27 @@ def main() -> None:
     print(f"epochs                : {args.epochs}")
     print(f"batch_size            : {args.batch_size}")
     print(f"learning_rate         : {args.learning_rate}")
+    print(f"fit_split             : {args.fit_split}")
+    print(f"split_mode            : {args.split_mode}")
 
     filtered, user_map, item_map, sequences, _ = build_aligned_sequences(args.reviews_path)
-    indexed_sequences = convert_sequences_to_indices(sequences, item_map)
+    fit_sequences = select_fit_sequences(
+        sequences,
+        fit_split=args.fit_split,
+        split_mode=args.split_mode,
+    )
+    indexed_sequences = convert_sequences_to_indices(fit_sequences, item_map)
+    fit_interactions = build_interactions_from_sequences(
+        fit_sequences,
+        user_map=user_map,
+    )
+
+    non_empty_fit_sequences = sum(1 for sequence in fit_sequences.values() if sequence)
+    fit_sequence_items = sum(len(sequence) for sequence in fit_sequences.values())
+    print(
+        f"[fit] sequences_with_events={non_empty_fit_sequences}/{len(fit_sequences)} "
+        f"fit_interactions={len(fit_interactions)} fit_items={fit_sequence_items}"
+    )
 
     if args.method == "item_item_sppmi":
         embeddings = build_item_item_sppmi_embeddings(
@@ -568,7 +643,7 @@ def main() -> None:
         )
     elif args.method == "mf_bpr":
         embeddings = build_mf_bpr_embeddings(
-            filtered,
+            fit_interactions,
             user_map=user_map,
             item_map=item_map,
             embedding_dim=args.output_dim,
@@ -590,8 +665,8 @@ def main() -> None:
         args=args,
         num_users=len(user_map),
         num_items=len(item_map),
-        num_sequences=len(sequences),
-        num_interactions=len(filtered),
+        num_sequences=non_empty_fit_sequences,
+        num_interactions=len(fit_interactions),
     )
 
     print(f"[done] wrote {tuple(embeddings.shape)} float32 embeddings to {args.output_path}")

@@ -37,11 +37,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branching-factor", type=int, default=16)
     parser.add_argument("--max-iter", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--fit-buffer-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional split buffer root used to fit the quantizer on train-only items "
+            "while still encoding all items."
+        ),
+    )
+    parser.add_argument(
+        "--fit-buffer-split",
+        type=str,
+        default="train",
+        help="Which split under --fit-buffer-root supplies the item set used for quantizer fitting.",
+    )
     return parser.parse_args()
 
 
 def load_item_map(path: Path) -> dict[str, int]:
-    with open(path, "r", encoding="utf-8") as fp:
+    with open(path, "r", encoding="utf-8-sig") as fp:
         payload = json.load(fp)
     return {str(key): int(value) for key, value in payload.items()}
 
@@ -73,6 +88,44 @@ def build_method_kwargs(args: argparse.Namespace) -> dict:
     raise ValueError(f"Unsupported method: {args.method}")
 
 
+def resolve_split_root(buffer_root: Path, split_name: str) -> Path:
+    candidate = buffer_root / split_name
+    if (candidate / "stats.json").exists():
+        return candidate
+    if (buffer_root / "stats.json").exists():
+        return buffer_root
+    raise FileNotFoundError(f"Could not resolve split `{split_name}` under {buffer_root}.")
+
+
+def collect_fit_item_indices(split_root: Path) -> np.ndarray:
+    chunk_dirs = sorted(
+        [
+            path
+            for path in split_root.glob("chunk_*")
+            if path.is_dir() and (path / "samples.npz").exists()
+        ],
+        key=lambda path: int(path.name.split("_")[-1]),
+    )
+    if not chunk_dirs:
+        raise RuntimeError(f"No chunk directories found under {split_root}.")
+
+    fit_item_ids: set[int] = set()
+    for chunk_dir in chunk_dirs:
+        with np.load(chunk_dir / "samples.npz", allow_pickle=False) as payload:
+            target_item_ids = np.asarray(payload["target_item_ids"], dtype=np.int64)
+            history_item_ids = np.asarray(payload["history_item_ids"], dtype=np.int64)
+            history_mask = np.asarray(payload["history_mask"], dtype=np.bool_)
+
+        fit_item_ids.update(int(item_idx) for item_idx in target_item_ids.tolist() if int(item_idx) >= 0)
+        if history_item_ids.size > 0:
+            valid_history_item_ids = history_item_ids[history_mask]
+            fit_item_ids.update(int(item_idx) for item_idx in valid_history_item_ids.tolist() if int(item_idx) >= 0)
+
+    if not fit_item_ids:
+        raise RuntimeError(f"No valid item indices were found in split buffer {split_root}.")
+    return np.asarray(sorted(fit_item_ids), dtype=np.int64)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -97,7 +150,43 @@ def main() -> None:
         )
 
     quantizer = build_quantizer(args.method, **build_method_kwargs(args))
-    result = quantizer.fit_encode(embeddings)
+
+    fit_item_indices = None
+    fit_embeddings = embeddings
+    fit_scope = "all_items"
+    fit_buffer_root = None
+    fit_buffer_split = None
+    if args.fit_buffer_root is not None:
+        fit_buffer_root = args.fit_buffer_root.resolve()
+        fit_buffer_split = str(args.fit_buffer_split)
+        split_root = resolve_split_root(fit_buffer_root, fit_buffer_split)
+        fit_item_indices = collect_fit_item_indices(split_root)
+        fit_embeddings = embeddings[fit_item_indices]
+        fit_scope = f"buffer_split:{fit_buffer_split}"
+        print(
+            f"[fit] quantizer will fit on {fit_embeddings.shape[0]}/{embeddings.shape[0]} "
+            f"items from {split_root}"
+        )
+
+    quantizer.fit(fit_embeddings)
+    codes = quantizer.encode(embeddings)
+    reconstructed = quantizer.decode(codes)
+    reconstruction_mse_full = float(np.mean((embeddings - reconstructed) ** 2))
+    reconstruction_mse_fit = float(np.mean((fit_embeddings - reconstructed[fit_item_indices]) ** 2)) if fit_item_indices is not None else reconstruction_mse_full
+
+    result = {
+        "codes": codes,
+        "reconstructed": reconstructed,
+        "metadata": {
+            "method": args.method,
+            "fit_scope": fit_scope,
+            "fit_item_count": int(fit_embeddings.shape[0]),
+            "reconstruction_mse_full": reconstruction_mse_full,
+            "reconstruction_mse_fit": reconstruction_mse_fit,
+            "fit_buffer_root": (str(fit_buffer_root) if fit_buffer_root is not None else None),
+            "fit_buffer_split": fit_buffer_split,
+        },
+    }
 
     args.output_root.mkdir(parents=True, exist_ok=True)
     codes_path = args.output_root / "item_codes.npy"
@@ -106,15 +195,15 @@ def main() -> None:
     code_to_items_path = args.output_root / "code_to_items.json"
     manifest_path = args.output_root / "quantizer_manifest.json"
 
-    np.save(codes_path, result.codes.astype(np.int32, copy=False))
-    np.save(recon_path, result.reconstructed.astype(np.float32, copy=False))
+    np.save(codes_path, result["codes"].astype(np.int32, copy=False))
+    np.save(recon_path, result["reconstructed"].astype(np.float32, copy=False))
 
     idx_to_item = {idx: item_id for item_id, idx in item_map.items()}
     item_to_code = {}
     code_to_items = {}
-    for idx in range(result.codes.shape[0]):
+    for idx in range(result["codes"].shape[0]):
         item_id = idx_to_item[idx]
-        code = result.codes[idx]
+        code = result["codes"][idx]
         code_list = [int(value) for value in code.tolist()]
         item_to_code[item_id] = code_list
         key = code_to_string(code)
@@ -130,10 +219,10 @@ def main() -> None:
         "embeddings_path": str(args.embeddings_path),
         "item_map_path": str(args.item_map_path),
         "output_root": str(args.output_root),
-        "num_items": int(result.codes.shape[0]),
+        "num_items": int(result["codes"].shape[0]),
         "embedding_dim": int(embeddings.shape[1]),
-        "code_shape": list(result.codes.shape),
-        **result.metadata,
+        "code_shape": list(result["codes"].shape),
+        **result["metadata"],
     }
     with open(manifest_path, "w", encoding="utf-8") as fp:
         json.dump(manifest, fp, indent=2, ensure_ascii=False)

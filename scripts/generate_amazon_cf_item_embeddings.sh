@@ -17,6 +17,8 @@ cd "$ROOT_DIR"
 : "${SPPMI_SHIFT:=5.0}"
 : "${DEVICE:=}"
 : "${SEED:=0}"
+: "${FIT_SPLIT:=all}"
+: "${SPLIT_MODE:=leave_last_two}"
 
 export PYTHONUNBUFFERED=1
 
@@ -33,6 +35,8 @@ args=(
   --learning-rate "${LEARNING_RATE}"
   --reg-weight "${REG_WEIGHT}"
   --sppmi-shift "${SPPMI_SHIFT}"
+  --fit-split "${FIT_SPLIT}"
+  --split-mode "${SPLIT_MODE}"
   --seed "${SEED}"
   --overwrite
 )

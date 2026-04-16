@@ -52,4 +52,6 @@ bash scripts/run_genrec_hybrid_diffusion_stage2_fullmodal_fromscratch_pipeline.s
 
 By default this from-scratch pipeline skips a separate final full evaluation and relies on the `full` run inside the ablation suite. Set `RUN_FINAL_FULL_EVAL=1` to restore the extra standalone full evaluation.
 
+The semantic-ID preparation pipeline now supports a stricter protocol for behavior-derived features. In `scripts/prepare_genrec_semantic_ids.sh`, the defaults are `CF_FIT_SPLIT=train` and `SEMANTIC_ID_FIT_SPLIT=train`, meaning CF embeddings are fitted on the train prefix only and the semantic-ID quantizer is fitted on train-seen items before encoding the full item table. Set either variable to `all` if you explicitly want the older behavior.
+
 The stage-2 eval and ablation wrappers also accept `NUM_PROCESSES` and `MIXED_PRECISION`, so on a dual-GPU server you can launch evaluation with `NUM_PROCESSES=2 MIXED_PRECISION=bf16` and use both cards for the final full run and follow-up ablations.
