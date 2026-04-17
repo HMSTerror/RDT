@@ -9,8 +9,8 @@ if [[ -f ".venv/bin/activate" ]]; then
   source .venv/bin/activate
 fi
 
-: "${CONFIG_PATH:=configs/genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v12_cf_every_other.yaml}"
-: "${OUTPUT_DIR:=checkpoints/genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v12_cf_every_other}"
+: "${CONFIG_PATH:=configs/genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v14_cf_only_main.yaml}"
+: "${OUTPUT_DIR:=checkpoints/genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v14_cf_only_main}"
 : "${NUM_PROCESSES:=2}"
 : "${MIXED_PRECISION:=bf16}"
 : "${TRAIN_BATCH_SIZE:=8}"
@@ -19,9 +19,9 @@ fi
 : "${SAVE_EVERY_EPOCHS:=10}"
 : "${EVAL_EVERY_EPOCHS:=10}"
 : "${LOGGING_STEPS:=50}"
-: "${TRAIN_LOG_PATH:=logs/genrec_stage2_fullmodal_fromscratch_train.log}"
-: "${FINAL_EVAL_LOG_DIR:=logs/genrec_stage2_fullmodal_fromscratch_eval}"
-: "${ABLATION_LOG_ROOT:=logs/genrec_stage2_fullmodal_fromscratch_ablation}"
+: "${TRAIN_LOG_PATH:=logs/genrec_stage2_fullmodal_v14_cf_only_main_train.log}"
+: "${FINAL_EVAL_LOG_DIR:=logs/genrec_stage2_fullmodal_v14_cf_only_main_eval}"
+: "${ABLATION_LOG_ROOT:=logs/genrec_stage2_fullmodal_v14_cf_only_main_ablation}"
 : "${RUN_FINAL_FULL_EVAL:=0}"
 
 mkdir -p "$(dirname "${TRAIN_LOG_PATH}")" "${FINAL_EVAL_LOG_DIR}" "${ABLATION_LOG_ROOT}"

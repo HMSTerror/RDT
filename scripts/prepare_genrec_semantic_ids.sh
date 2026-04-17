@@ -20,6 +20,7 @@ cd "${ROOT_DIR}"
 : "${CF_FIT_SPLIT:=train}"
 : "${CF_SPLIT_MODE:=leave_last_two}"
 : "${SEMANTIC_ID_FIT_SPLIT:=train}"
+: "${PRIMARY_EMBED_SOURCE:=auto}"
 
 echo "========== [1/7] text embeddings =========="
 OUTPUT_PATH="${TEXT_EMBED_PATH}" \
@@ -79,7 +80,6 @@ SPLIT_MODE=leave_last_two \
 ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
 bash scripts/preprocess_amazon_minimal.sh
 
-INPUT_EMBED_PATH="${TEXT_EMBED_PATH}"
 if [[ "${ENABLE_FUSION:-0}" == "1" ]]; then
   echo "========== [5/7] multimodal fusion =========="
   fusion_args=(
@@ -98,10 +98,49 @@ if [[ "${ENABLE_FUSION:-0}" == "1" ]]; then
   fi
   fusion_args+=(--text-weight "${FUSION_TEXT_WEIGHT:-1.0}")
   python "${fusion_args[@]}"
-  INPUT_EMBED_PATH="${FUSED_EMBED_PATH}"
 else
   echo "========== [5/7] multimodal fusion skipped =========="
 fi
+
+case "${PRIMARY_EMBED_SOURCE}" in
+  auto)
+    if [[ "${ENABLE_FUSION:-0}" == "1" ]]; then
+      INPUT_EMBED_PATH="${FUSED_EMBED_PATH}"
+    else
+      INPUT_EMBED_PATH="${TEXT_EMBED_PATH}"
+    fi
+    ;;
+  text)
+    INPUT_EMBED_PATH="${TEXT_EMBED_PATH}"
+    ;;
+  image)
+    if [[ "${ENABLE_IMAGE:-1}" != "1" ]]; then
+      echo "PRIMARY_EMBED_SOURCE=image requires ENABLE_IMAGE=1" >&2
+      exit 1
+    fi
+    INPUT_EMBED_PATH="${IMAGE_EMBED_PATH}"
+    ;;
+  cf)
+    if [[ "${ENABLE_CF:-0}" != "1" ]]; then
+      echo "PRIMARY_EMBED_SOURCE=cf requires ENABLE_CF=1" >&2
+      exit 1
+    fi
+    INPUT_EMBED_PATH="${CF_EMBED_PATH}"
+    ;;
+  fused)
+    if [[ "${ENABLE_FUSION:-0}" != "1" ]]; then
+      echo "PRIMARY_EMBED_SOURCE=fused requires ENABLE_FUSION=1" >&2
+      exit 1
+    fi
+    INPUT_EMBED_PATH="${FUSED_EMBED_PATH}"
+    ;;
+  *)
+    echo "Unsupported PRIMARY_EMBED_SOURCE=${PRIMARY_EMBED_SOURCE}. Use one of: auto, text, image, cf, fused." >&2
+    exit 1
+    ;;
+esac
+
+echo "semantic_id_input : ${INPUT_EMBED_PATH}"
 
 echo "========== [6/7] semantic ID quantization =========="
 semantic_id_args=(
