@@ -1,0 +1,132 @@
+experiment_name: genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v14_cf_only_main_aligned_lowdrop_auxretrieval
+
+data:
+  dataset_name: amazon_music
+  split_root: buffer/amazon_music_real
+  tokenized_root: data/Amazon_Music_And_Instruments/tokenized_semantic_ids_cf_only
+  semantic_id_root: data/Amazon_Music_And_Instruments/semantic_ids_pq_cf_only
+  train_split: train
+  valid_split: val
+  test_split: test
+  history_len: 50
+
+representation:
+  target_latent_path: data/Amazon_Music_And_Instruments/item_embeddings_cf.npy
+  latent_dim: 128
+  normalize_target_latent: true
+
+tokenization:
+  enabled: true
+  semantic_id_method: residual_quantization
+  code_len: 4
+  vocab_sizes: [256, 256, 256, 256]
+  pad_token_id: 0
+  mask_token_id: 1
+  cls_token_id: 2
+  sep_token_id: 3
+  eos_token_id: 4
+
+backbone:
+  name: genrec_hybrid_diffusion
+  base_runner: rdt
+  hidden_size: 1024
+  depth: 12
+  num_heads: 16
+  max_seq_len: 256
+  dropout: 0.0
+
+conditioning:
+  use_text: true
+  use_image: true
+  use_cf: false
+  use_popularity: false
+  text_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_text_to_cf.npy
+  image_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_image_to_cf.npy
+  cf_embedding_path: data/Amazon_Music_And_Instruments/item_embeddings_cf.npy
+  popularity_num_buckets: 16
+  popularity_cond_dim: 32
+  use_text_history: true
+  use_text_pooled: true
+  use_target_text: false
+  use_image_history: true
+  use_image_pooled: true
+  use_target_image: false
+  use_cf_history: false
+  use_cf_pooled: false
+  use_target_cf: false
+  use_popularity_history: true
+  use_popularity_pooled: true
+  layer_injection:
+    text: all
+    image: all
+    cf: none
+    popularity: none
+  training_dropout:
+    keep_pooled_condition_tokens: true
+    branch_dropout:
+      text: 0.05
+      image: 0.05
+      cf: 0.00
+      popularity: 0.00
+    history_token_keep_rate:
+      text: 1.00
+      image: 1.00
+      cf: 1.00
+      popularity: 1.00
+
+diffusion:
+  prediction_type: epsilon
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  num_inference_steps: 50
+
+training:
+  objective: hybrid_diffusion_with_semantic_context_stage2_cf_only_main_aligned_lowdrop_auxretrieval
+  batch_size: 16
+  num_train_epochs: 30
+  max_train_steps:
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  lr_scheduler: cosine
+  warmup_steps: 500
+  eval_steps:
+  save_steps: 0
+  eval_every_epochs: 1
+  save_every_epochs: 0
+  run_train_final_eval: true
+  val_subset_size: 2048
+  val_subset_offset: 0
+  early_stopping:
+    enabled: true
+    metric: loss
+    mode: min
+    patience: 3
+    min_delta: 0.0005
+    warmup_epochs: 3
+    save_best_snapshot: true
+  diffusion_loss_weight: 1.0
+  ranking_loss_weight: 0.1
+  ranking_temperature: 0.07
+  auxiliary_retrieval:
+    enabled: true
+    text_weight: 0.1
+    image_weight: 0.1
+    temperature: 0.07
+  tail_sampler:
+    enabled: false
+    power: 0.5
+    min_weight: 0.25
+    max_weight: 4.0
+  ranking_reweight:
+    enabled: false
+    power: 0.5
+    min_weight: 0.5
+    max_weight: 3.0
+
+evaluation:
+  batch_size: 16
+  topk: [5, 10, 20]
+  metrics: [mean_rank, hit, ndcg, mrr]
+  exclude_history_items: true
+  group_strategy: equal_items
+  frequency_source_split: train

@@ -22,6 +22,8 @@ class HybridDiffusionOutput:
     denoised_latents: torch.Tensor
     target_positions: torch.Tensor
     hidden_states: torch.Tensor
+    text_aux_query: torch.Tensor | None = None
+    image_aux_query: torch.Tensor | None = None
 
 
 @dataclass
@@ -153,6 +155,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
             [GenRecDiTBlock(self.hidden_size, self.num_heads, dropout=dropout) for _ in range(self.depth)]
         )
         self.final_norm = RmsNorm(self.hidden_size, eps=1e-6)
+        self.text_aux_head = None
+        self.image_aux_head = None
 
         self.text_condition_projector = None
         if text_cond_dim is not None and any(self.layer_schedule.text):
@@ -165,6 +169,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 use_target=use_text_target,
                 dropout=dropout,
             )
+            self.text_aux_head = nn.Linear(self.hidden_size, self.latent_dim)
 
         self.image_condition_projector = None
         if image_cond_dim is not None and any(self.layer_schedule.image):
@@ -177,6 +182,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 use_target=use_image_target,
                 dropout=dropout,
             )
+            self.image_aux_head = nn.Linear(self.hidden_size, self.latent_dim)
 
         self.cf_condition_projector = None
         if cf_cond_dim is not None and any(self.layer_schedule.cf):
@@ -690,6 +696,40 @@ class GenRecHybridDiffusionRunner(nn.Module):
         sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
         return (noisy_target_latents - sqrt_one_minus_alpha_bar * eps_prediction) / sqrt_alpha_bar.clamp_min(1e-6)
 
+    def _build_aux_query(
+        self,
+        branch_output: ConditionProjectorOutput,
+        head: nn.Linear | None,
+    ) -> torch.Tensor | None:
+        if head is None or branch_output.tokens is None or branch_output.attention_mask is None:
+            return None
+
+        tokens = branch_output.tokens
+        attention_mask = branch_output.attention_mask.to(device=tokens.device, dtype=torch.bool)
+
+        pooled_start = int(branch_output.history_token_count)
+        pooled_end = pooled_start + int(branch_output.pooled_token_count)
+        if branch_output.pooled_token_count > 0:
+            pooled_tokens = tokens[:, pooled_start:pooled_end]
+            pooled_mask = attention_mask[:, pooled_start:pooled_end]
+            pooled_weight = pooled_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+            pooled_summary = (
+                (pooled_tokens * pooled_weight).sum(dim=1)
+                / pooled_weight.sum(dim=1).clamp_min(1.0)
+            )
+        elif branch_output.history_token_count > 0:
+            history_tokens = tokens[:, : branch_output.history_token_count]
+            history_mask = attention_mask[:, : branch_output.history_token_count]
+            history_weight = history_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+            pooled_summary = (
+                (history_tokens * history_weight).sum(dim=1)
+                / history_weight.sum(dim=1).clamp_min(1.0)
+            )
+        else:
+            return None
+
+        return head(pooled_summary)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -811,11 +851,16 @@ class GenRecHybridDiffusionRunner(nn.Module):
         else:
             denoised = prediction
 
+        text_aux_query = self._build_aux_query(text_branch, self.text_aux_head)
+        image_aux_query = self._build_aux_query(image_branch, self.image_aux_head)
+
         return HybridDiffusionOutput(
             prediction=prediction,
             denoised_latents=denoised,
             target_positions=target_positions,
             hidden_states=hidden_states,
+            text_aux_query=text_aux_query,
+            image_aux_query=image_aux_query,
         )
 
     def compute_losses(
@@ -827,6 +872,9 @@ class GenRecHybridDiffusionRunner(nn.Module):
         diffusion_loss_weight: float = 1.0,
         ranking_loss_weight: float = 0.0,
         ranking_temperature: float = 0.07,
+        text_auxiliary_loss_weight: float = 0.0,
+        image_auxiliary_loss_weight: float = 0.0,
+        auxiliary_ranking_temperature: float | None = None,
         target_item_ids: torch.Tensor | None = None,
         item_embedding_table: torch.Tensor | None = None,
         ranking_sample_weights: torch.Tensor | None = None,
@@ -862,12 +910,77 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 ranking_loss = per_sample_ranking_loss.mean()
             total_loss = total_loss + ranking_loss * float(ranking_loss_weight)
 
+        aux_temperature = (
+            float(auxiliary_ranking_temperature)
+            if auxiliary_ranking_temperature is not None
+            else float(ranking_temperature)
+        )
+        text_auxiliary_loss = None
+        if (
+            float(text_auxiliary_loss_weight) > 0
+            and output.text_aux_query is not None
+            and target_item_ids is not None
+            and item_embedding_table is not None
+        ):
+            text_query = F.normalize(output.text_aux_query.float(), dim=-1)
+            item_table = F.normalize(item_embedding_table.float(), dim=-1)
+            text_logits = text_query @ item_table.t()
+            text_logits = text_logits / max(aux_temperature, 1e-6)
+            text_per_sample_loss = F.cross_entropy(
+                text_logits,
+                target_item_ids.to(device=text_query.device, dtype=torch.long),
+                reduction="none",
+            )
+            if ranking_sample_weights is not None:
+                text_sample_weights = ranking_sample_weights.to(
+                    device=text_per_sample_loss.device,
+                    dtype=text_per_sample_loss.dtype,
+                )
+                text_auxiliary_loss = (
+                    text_per_sample_loss * text_sample_weights
+                ).sum() / text_sample_weights.sum().clamp_min(1e-6)
+            else:
+                text_auxiliary_loss = text_per_sample_loss.mean()
+            total_loss = total_loss + text_auxiliary_loss * float(text_auxiliary_loss_weight)
+
+        image_auxiliary_loss = None
+        if (
+            float(image_auxiliary_loss_weight) > 0
+            and output.image_aux_query is not None
+            and target_item_ids is not None
+            and item_embedding_table is not None
+        ):
+            image_query = F.normalize(output.image_aux_query.float(), dim=-1)
+            item_table = F.normalize(item_embedding_table.float(), dim=-1)
+            image_logits = image_query @ item_table.t()
+            image_logits = image_logits / max(aux_temperature, 1e-6)
+            image_per_sample_loss = F.cross_entropy(
+                image_logits,
+                target_item_ids.to(device=image_query.device, dtype=torch.long),
+                reduction="none",
+            )
+            if ranking_sample_weights is not None:
+                image_sample_weights = ranking_sample_weights.to(
+                    device=image_per_sample_loss.device,
+                    dtype=image_per_sample_loss.dtype,
+                )
+                image_auxiliary_loss = (
+                    image_per_sample_loss * image_sample_weights
+                ).sum() / image_sample_weights.sum().clamp_min(1e-6)
+            else:
+                image_auxiliary_loss = image_per_sample_loss.mean()
+            total_loss = total_loss + image_auxiliary_loss * float(image_auxiliary_loss_weight)
+
         payload = {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
         }
         if ranking_loss is not None:
             payload["ranking_loss"] = ranking_loss
+        if text_auxiliary_loss is not None:
+            payload["text_auxiliary_loss"] = text_auxiliary_loss
+        if image_auxiliary_loss is not None:
+            payload["image_auxiliary_loss"] = image_auxiliary_loss
         return payload
 
     def prepare_training_inputs(

@@ -328,6 +328,9 @@ def evaluate(
     diffusion_loss_weight: float,
     ranking_loss_weight: float,
     ranking_temperature: float,
+    text_auxiliary_loss_weight: float,
+    image_auxiliary_loss_weight: float,
+    auxiliary_ranking_temperature: float | None,
     desc: str,
 ) -> dict[str, float]:
     if dataloader is None:
@@ -337,6 +340,8 @@ def evaluate(
     model.eval()
     diffusion_losses: list[float] = []
     ranking_losses: list[float] = []
+    text_auxiliary_losses: list[float] = []
+    image_auxiliary_losses: list[float] = []
     total_losses: list[float] = []
     progress_bar = tqdm(
         dataloader,
@@ -364,6 +369,9 @@ def evaluate(
             diffusion_loss_weight=diffusion_loss_weight,
             ranking_loss_weight=ranking_loss_weight,
             ranking_temperature=ranking_temperature,
+            text_auxiliary_loss_weight=text_auxiliary_loss_weight,
+            image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+            auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             target_item_ids=batch.get("target_item_ids"),
             item_embedding_table=item_latent_table,
         )
@@ -374,6 +382,12 @@ def evaluate(
         if "ranking_loss" in loss_dict:
             gathered_rank = accelerator.gather_for_metrics(loss_dict["ranking_loss"].detach().reshape(1))
             ranking_losses.append(float(gathered_rank.mean().item()))
+        if "text_auxiliary_loss" in loss_dict:
+            gathered_text_aux = accelerator.gather_for_metrics(loss_dict["text_auxiliary_loss"].detach().reshape(1))
+            text_auxiliary_losses.append(float(gathered_text_aux.mean().item()))
+        if "image_auxiliary_loss" in loss_dict:
+            gathered_image_aux = accelerator.gather_for_metrics(loss_dict["image_auxiliary_loss"].detach().reshape(1))
+            image_auxiliary_losses.append(float(gathered_image_aux.mean().item()))
 
     model.train()
     metrics = {}
@@ -383,6 +397,10 @@ def evaluate(
         metrics["diffusion_loss"] = float(sum(diffusion_losses) / len(diffusion_losses))
     if ranking_losses:
         metrics["ranking_loss"] = float(sum(ranking_losses) / len(ranking_losses))
+    if text_auxiliary_losses:
+        metrics["text_auxiliary_loss"] = float(sum(text_auxiliary_losses) / len(text_auxiliary_losses))
+    if image_auxiliary_losses:
+        metrics["image_auxiliary_loss"] = float(sum(image_auxiliary_losses) / len(image_auxiliary_losses))
     return metrics
 
 
@@ -657,6 +675,20 @@ def main() -> None:
     diffusion_loss_weight = float(training_cfg.get("diffusion_loss_weight", 1.0))
     ranking_loss_weight = float(training_cfg.get("ranking_loss_weight", 0.0))
     ranking_temperature = float(training_cfg.get("ranking_temperature", 0.07))
+    auxiliary_retrieval_cfg = training_cfg.get("auxiliary_retrieval", {})
+    auxiliary_retrieval_enabled = bool(auxiliary_retrieval_cfg.get("enabled", False))
+    text_auxiliary_loss_weight = float(
+        auxiliary_retrieval_cfg.get("text_weight", 0.0 if not auxiliary_retrieval_enabled else 0.1)
+    )
+    image_auxiliary_loss_weight = float(
+        auxiliary_retrieval_cfg.get("image_weight", 0.0 if not auxiliary_retrieval_enabled else 0.1)
+    )
+    auxiliary_ranking_temperature_cfg = auxiliary_retrieval_cfg.get("temperature")
+    auxiliary_ranking_temperature = (
+        float(auxiliary_ranking_temperature_cfg)
+        if auxiliary_ranking_temperature_cfg is not None
+        else None
+    )
     tail_sampler_cfg = training_cfg.get("tail_sampler", {})
     tail_sampler_enabled = bool(tail_sampler_cfg.get("enabled", False))
     tail_sampler_power = float(tail_sampler_cfg.get("power", 0.5))
@@ -872,6 +904,12 @@ def main() -> None:
         "diffusion_loss_weight": diffusion_loss_weight,
         "ranking_loss_weight": ranking_loss_weight,
         "ranking_temperature": ranking_temperature,
+        "auxiliary_retrieval": {
+            "enabled": auxiliary_retrieval_enabled,
+            "text_weight": text_auxiliary_loss_weight,
+            "image_weight": image_auxiliary_loss_weight,
+            "temperature": auxiliary_ranking_temperature,
+        },
         "eval_steps": int(eval_steps) if eval_steps else None,
         "save_steps": int(save_steps) if save_steps else None,
         "eval_every_epochs": int(eval_every_epochs) if eval_every_epochs else None,
@@ -1025,6 +1063,8 @@ def main() -> None:
         epoch_train_losses: list[float] = []
         epoch_train_diffusion_losses: list[float] = []
         epoch_train_ranking_losses: list[float] = []
+        epoch_train_text_auxiliary_losses: list[float] = []
+        epoch_train_image_auxiliary_losses: list[float] = []
         for batch in train_loader:
             if global_step >= max_train_steps:
                 break
@@ -1050,6 +1090,9 @@ def main() -> None:
                 diffusion_loss_weight=diffusion_loss_weight,
                 ranking_loss_weight=ranking_loss_weight,
                 ranking_temperature=ranking_temperature,
+                text_auxiliary_loss_weight=text_auxiliary_loss_weight,
+                image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 target_item_ids=batch.get("target_item_ids"),
                 item_embedding_table=item_latent_table,
                 ranking_sample_weights=(
@@ -1075,6 +1118,16 @@ def main() -> None:
                     if "ranking_loss" in loss_dict
                     else "n/a"
                 ),
+                text_aux=(
+                    f"{loss_dict['text_auxiliary_loss'].detach().float().item():.4f}"
+                    if "text_auxiliary_loss" in loss_dict
+                    else "n/a"
+                ),
+                image_aux=(
+                    f"{loss_dict['image_auxiliary_loss'].detach().float().item():.4f}"
+                    if "image_auxiliary_loss" in loss_dict
+                    else "n/a"
+                ),
                 lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
             )
 
@@ -1086,6 +1139,10 @@ def main() -> None:
                 )
                 if "ranking_loss" in loss_dict:
                     msg += f" rank={loss_dict['ranking_loss'].detach().float().item():.6f}"
+                if "text_auxiliary_loss" in loss_dict:
+                    msg += f" text_aux={loss_dict['text_auxiliary_loss'].detach().float().item():.6f}"
+                if "image_auxiliary_loss" in loss_dict:
+                    msg += f" image_aux={loss_dict['image_auxiliary_loss'].detach().float().item():.6f}"
                 maybe_print(accelerator, msg)
 
             gathered_total = accelerator.gather_for_metrics(loss.detach().reshape(1))
@@ -1095,6 +1152,16 @@ def main() -> None:
             if "ranking_loss" in loss_dict:
                 gathered_rank = accelerator.gather_for_metrics(loss_dict["ranking_loss"].detach().reshape(1))
                 epoch_train_ranking_losses.append(float(gathered_rank.mean().item()))
+            if "text_auxiliary_loss" in loss_dict:
+                gathered_text_aux = accelerator.gather_for_metrics(
+                    loss_dict["text_auxiliary_loss"].detach().reshape(1)
+                )
+                epoch_train_text_auxiliary_losses.append(float(gathered_text_aux.mean().item()))
+            if "image_auxiliary_loss" in loss_dict:
+                gathered_image_aux = accelerator.gather_for_metrics(
+                    loss_dict["image_auxiliary_loss"].detach().reshape(1)
+                )
+                epoch_train_image_auxiliary_losses.append(float(gathered_image_aux.mean().item()))
 
             if eval_steps and valid_loader is not None and global_step % int(eval_steps) == 0:
                 metrics = evaluate(
@@ -1106,6 +1173,9 @@ def main() -> None:
                     diffusion_loss_weight=diffusion_loss_weight,
                     ranking_loss_weight=ranking_loss_weight,
                     ranking_temperature=ranking_temperature,
+                    text_auxiliary_loss_weight=text_auxiliary_loss_weight,
+                    image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                    auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                     desc=f"Eval@{global_step}",
                 )
                 if metrics:
@@ -1165,6 +1235,14 @@ def main() -> None:
             epoch_metrics["ranking_loss"] = float(
                 sum(epoch_train_ranking_losses) / len(epoch_train_ranking_losses)
             )
+        if epoch_train_text_auxiliary_losses:
+            epoch_metrics["text_auxiliary_loss"] = float(
+                sum(epoch_train_text_auxiliary_losses) / len(epoch_train_text_auxiliary_losses)
+            )
+        if epoch_train_image_auxiliary_losses:
+            epoch_metrics["image_auxiliary_loss"] = float(
+                sum(epoch_train_image_auxiliary_losses) / len(epoch_train_image_auxiliary_losses)
+            )
         if epoch_metrics:
             maybe_print(
                 accelerator,
@@ -1196,6 +1274,9 @@ def main() -> None:
                 diffusion_loss_weight=diffusion_loss_weight,
                 ranking_loss_weight=ranking_loss_weight,
                 ranking_temperature=ranking_temperature,
+                text_auxiliary_loss_weight=text_auxiliary_loss_weight,
+                image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 desc=f"EvalEpoch@{completed_epoch}",
             )
             if metrics:
@@ -1251,6 +1332,9 @@ def main() -> None:
             diffusion_loss_weight=diffusion_loss_weight,
             ranking_loss_weight=ranking_loss_weight,
             ranking_temperature=ranking_temperature,
+            text_auxiliary_loss_weight=text_auxiliary_loss_weight,
+            image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+            auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             desc="Final Eval",
         )
         if final_metrics:
