@@ -56,5 +56,4 @@ MAX_EVAL_BATCHES="${MAX_EVAL_BATCHES}" \
 PRINT_EVERY="${PRINT_EVERY}" \
 EVAL_SEED="${EVAL_SEED}" \
 ABLATION_LOG_ROOT="${ABLATION_LOG_ROOT}" \
-VARIANT_SPECS="full=;no_text=text;no_cf=cf;no_image=image" \
 bash scripts/run_genrec_hybrid_diffusion_ablation_suite.sh

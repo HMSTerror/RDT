@@ -25,7 +25,47 @@ fi
 : "${PRINT_EVERY:=20}"
 : "${EVAL_SEED:=42}"
 : "${ABLATION_LOG_ROOT:=logs/genrec_ablation_suite}"
-: "${VARIANT_SPECS:=full=;no_text=text;no_image=image;no_cf=cf}"
+: "${VARIANT_SPECS:=auto}"
+
+resolve_variant_specs() {
+  if [[ "${VARIANT_SPECS}" != "auto" ]]; then
+    echo "${VARIANT_SPECS}"
+    return
+  fi
+
+  python - "${CONFIG_PATH}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+with open(config_path, "r", encoding="utf-8") as fp:
+    config = yaml.safe_load(fp) or {}
+
+conditioning = config.get("conditioning", {}) or {}
+variants = [("full", "")]
+
+if bool(conditioning.get("use_text", False)):
+    variants.append(("no_text", "text"))
+
+use_image = bool(
+    conditioning.get("use_image", False)
+    or conditioning.get("use_history_images", False)
+    or conditioning.get("use_target_image", False)
+)
+if use_image:
+    variants.append(("no_image", "image"))
+
+if bool(conditioning.get("use_cf", False)):
+    variants.append(("no_cf", "cf"))
+
+print(";".join(f"{tag}={occlude}" for tag, occlude in variants))
+PY
+}
+
+VARIANT_SPECS="$(resolve_variant_specs)"
+echo "Using ablation variants: ${VARIANT_SPECS}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${ABLATION_LOG_ROOT}/${STAMP}"
