@@ -162,6 +162,29 @@ def resolve_training_value(cli_value, config_section: dict, key: str, default):
     return config_section.get(key, default)
 
 
+def resolve_auxiliary_weight_for_epoch(
+    *,
+    default_weight: float,
+    curriculum_cfg: dict,
+    epoch_value: float,
+    modality_key: str,
+) -> float:
+    if not curriculum_cfg or not bool(curriculum_cfg.get("enabled", False)):
+        return float(default_weight)
+
+    high_epochs = int(curriculum_cfg.get("high_epochs", 0))
+    shared_high_weight = curriculum_cfg.get("high_weight")
+    shared_low_weight = curriculum_cfg.get("low_weight")
+    modality_high_weight = curriculum_cfg.get(f"{modality_key}_high_weight", shared_high_weight)
+    modality_low_weight = curriculum_cfg.get(f"{modality_key}_low_weight", shared_low_weight)
+
+    high_weight = float(modality_high_weight if modality_high_weight is not None else default_weight)
+    low_weight = float(modality_low_weight if modality_low_weight is not None else default_weight)
+    if float(epoch_value) <= float(high_epochs):
+        return high_weight
+    return low_weight
+
+
 def append_metrics_history(history_path: Path, record: dict) -> None:
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with open(history_path, "a", encoding="utf-8") as fp:
@@ -689,6 +712,7 @@ def main() -> None:
         if auxiliary_ranking_temperature_cfg is not None
         else None
     )
+    auxiliary_retrieval_curriculum_cfg = auxiliary_retrieval_cfg.get("curriculum", {})
     tail_sampler_cfg = training_cfg.get("tail_sampler", {})
     tail_sampler_enabled = bool(tail_sampler_cfg.get("enabled", False))
     tail_sampler_power = float(tail_sampler_cfg.get("power", 0.5))
@@ -909,6 +933,7 @@ def main() -> None:
             "text_weight": text_auxiliary_loss_weight,
             "image_weight": image_auxiliary_loss_weight,
             "temperature": auxiliary_ranking_temperature,
+            "curriculum": auxiliary_retrieval_curriculum_cfg,
         },
         "eval_steps": int(eval_steps) if eval_steps else None,
         "save_steps": int(save_steps) if save_steps else None,
@@ -1060,6 +1085,25 @@ def main() -> None:
 
     for epoch_idx in range(starting_epoch, num_train_epochs):
         model.train()
+        current_epoch_value = float(epoch_idx + 1)
+        current_text_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=text_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=current_epoch_value,
+            modality_key="text",
+        )
+        current_image_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=image_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=current_epoch_value,
+            modality_key="image",
+        )
+        maybe_print(
+            accelerator,
+            f"[epoch {epoch_idx + 1}] auxiliary weights: "
+            f"text={current_text_auxiliary_loss_weight:.4f} "
+            f"image={current_image_auxiliary_loss_weight:.4f}",
+        )
         epoch_train_losses: list[float] = []
         epoch_train_diffusion_losses: list[float] = []
         epoch_train_ranking_losses: list[float] = []
@@ -1090,8 +1134,8 @@ def main() -> None:
                 diffusion_loss_weight=diffusion_loss_weight,
                 ranking_loss_weight=ranking_loss_weight,
                 ranking_temperature=ranking_temperature,
-                text_auxiliary_loss_weight=text_auxiliary_loss_weight,
-                image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
+                image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 target_item_ids=batch.get("target_item_ids"),
                 item_embedding_table=item_latent_table,
@@ -1173,8 +1217,8 @@ def main() -> None:
                     diffusion_loss_weight=diffusion_loss_weight,
                     ranking_loss_weight=ranking_loss_weight,
                     ranking_temperature=ranking_temperature,
-                    text_auxiliary_loss_weight=text_auxiliary_loss_weight,
-                    image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                    text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
+                    image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
                     auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                     desc=f"Eval@{global_step}",
                 )
@@ -1274,8 +1318,8 @@ def main() -> None:
                 diffusion_loss_weight=diffusion_loss_weight,
                 ranking_loss_weight=ranking_loss_weight,
                 ranking_temperature=ranking_temperature,
-                text_auxiliary_loss_weight=text_auxiliary_loss_weight,
-                image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+                text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
+                image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 desc=f"EvalEpoch@{completed_epoch}",
             )
@@ -1323,6 +1367,19 @@ def main() -> None:
 
     final_metrics = {}
     if valid_loader is not None and run_train_final_eval:
+        final_epoch_for_aux = float(completed_epoch if "completed_epoch" in locals() else num_train_epochs)
+        final_text_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=text_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=final_epoch_for_aux,
+            modality_key="text",
+        )
+        final_image_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=image_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=final_epoch_for_aux,
+            modality_key="image",
+        )
         final_metrics = evaluate(
             accelerator=accelerator,
             model=model,
@@ -1332,8 +1389,8 @@ def main() -> None:
             diffusion_loss_weight=diffusion_loss_weight,
             ranking_loss_weight=ranking_loss_weight,
             ranking_temperature=ranking_temperature,
-            text_auxiliary_loss_weight=text_auxiliary_loss_weight,
-            image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+            text_auxiliary_loss_weight=final_text_auxiliary_loss_weight,
+            image_auxiliary_loss_weight=final_image_auxiliary_loss_weight,
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             desc="Final Eval",
         )

@@ -109,9 +109,14 @@ training:
   ranking_temperature: 0.07
   auxiliary_retrieval:
     enabled: true
-    text_weight: 0.1
-    image_weight: 0.1
+    text_weight: 0.15
+    image_weight: 0.15
     temperature: 0.07
+    curriculum:
+      enabled: true
+      high_epochs: 5
+      high_weight: 0.3
+      low_weight: 0.15
   tail_sampler:
     enabled: false
     power: 0.5
