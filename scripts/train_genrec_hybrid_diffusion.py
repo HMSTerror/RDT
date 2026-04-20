@@ -353,6 +353,8 @@ def evaluate(
     ranking_temperature: float,
     text_auxiliary_loss_weight: float,
     image_auxiliary_loss_weight: float,
+    text_history_auxiliary_loss_weight: float,
+    image_history_auxiliary_loss_weight: float,
     auxiliary_ranking_temperature: float | None,
     desc: str,
 ) -> dict[str, float]:
@@ -365,6 +367,8 @@ def evaluate(
     ranking_losses: list[float] = []
     text_auxiliary_losses: list[float] = []
     image_auxiliary_losses: list[float] = []
+    text_history_auxiliary_losses: list[float] = []
+    image_history_auxiliary_losses: list[float] = []
     total_losses: list[float] = []
     progress_bar = tqdm(
         dataloader,
@@ -394,6 +398,8 @@ def evaluate(
             ranking_temperature=ranking_temperature,
             text_auxiliary_loss_weight=text_auxiliary_loss_weight,
             image_auxiliary_loss_weight=image_auxiliary_loss_weight,
+            text_history_auxiliary_loss_weight=text_history_auxiliary_loss_weight,
+            image_history_auxiliary_loss_weight=image_history_auxiliary_loss_weight,
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             target_item_ids=batch.get("target_item_ids"),
             item_embedding_table=item_latent_table,
@@ -411,6 +417,16 @@ def evaluate(
         if "image_auxiliary_loss" in loss_dict:
             gathered_image_aux = accelerator.gather_for_metrics(loss_dict["image_auxiliary_loss"].detach().reshape(1))
             image_auxiliary_losses.append(float(gathered_image_aux.mean().item()))
+        if "text_history_auxiliary_loss" in loss_dict:
+            gathered_text_history_aux = accelerator.gather_for_metrics(
+                loss_dict["text_history_auxiliary_loss"].detach().reshape(1)
+            )
+            text_history_auxiliary_losses.append(float(gathered_text_history_aux.mean().item()))
+        if "image_history_auxiliary_loss" in loss_dict:
+            gathered_image_history_aux = accelerator.gather_for_metrics(
+                loss_dict["image_history_auxiliary_loss"].detach().reshape(1)
+            )
+            image_history_auxiliary_losses.append(float(gathered_image_history_aux.mean().item()))
 
     model.train()
     metrics = {}
@@ -424,6 +440,14 @@ def evaluate(
         metrics["text_auxiliary_loss"] = float(sum(text_auxiliary_losses) / len(text_auxiliary_losses))
     if image_auxiliary_losses:
         metrics["image_auxiliary_loss"] = float(sum(image_auxiliary_losses) / len(image_auxiliary_losses))
+    if text_history_auxiliary_losses:
+        metrics["text_history_auxiliary_loss"] = float(
+            sum(text_history_auxiliary_losses) / len(text_history_auxiliary_losses)
+        )
+    if image_history_auxiliary_losses:
+        metrics["image_history_auxiliary_loss"] = float(
+            sum(image_history_auxiliary_losses) / len(image_history_auxiliary_losses)
+        )
     return metrics
 
 
@@ -706,6 +730,12 @@ def main() -> None:
     image_auxiliary_loss_weight = float(
         auxiliary_retrieval_cfg.get("image_weight", 0.0 if not auxiliary_retrieval_enabled else 0.1)
     )
+    text_history_auxiliary_loss_weight = float(
+        auxiliary_retrieval_cfg.get("text_history_weight", 0.0)
+    )
+    image_history_auxiliary_loss_weight = float(
+        auxiliary_retrieval_cfg.get("image_history_weight", 0.0)
+    )
     auxiliary_ranking_temperature_cfg = auxiliary_retrieval_cfg.get("temperature")
     auxiliary_ranking_temperature = (
         float(auxiliary_ranking_temperature_cfg)
@@ -932,6 +962,8 @@ def main() -> None:
             "enabled": auxiliary_retrieval_enabled,
             "text_weight": text_auxiliary_loss_weight,
             "image_weight": image_auxiliary_loss_weight,
+            "text_history_weight": text_history_auxiliary_loss_weight,
+            "image_history_weight": image_history_auxiliary_loss_weight,
             "temperature": auxiliary_ranking_temperature,
             "curriculum": auxiliary_retrieval_curriculum_cfg,
         },
@@ -1098,17 +1130,33 @@ def main() -> None:
             epoch_value=current_epoch_value,
             modality_key="image",
         )
+        current_text_history_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=text_history_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=current_epoch_value,
+            modality_key="text_history",
+        )
+        current_image_history_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=image_history_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=current_epoch_value,
+            modality_key="image_history",
+        )
         maybe_print(
             accelerator,
             f"[epoch {epoch_idx + 1}] auxiliary weights: "
             f"text={current_text_auxiliary_loss_weight:.4f} "
-            f"image={current_image_auxiliary_loss_weight:.4f}",
+            f"image={current_image_auxiliary_loss_weight:.4f} "
+            f"text_hist={current_text_history_auxiliary_loss_weight:.4f} "
+            f"image_hist={current_image_history_auxiliary_loss_weight:.4f}",
         )
         epoch_train_losses: list[float] = []
         epoch_train_diffusion_losses: list[float] = []
         epoch_train_ranking_losses: list[float] = []
         epoch_train_text_auxiliary_losses: list[float] = []
         epoch_train_image_auxiliary_losses: list[float] = []
+        epoch_train_text_history_auxiliary_losses: list[float] = []
+        epoch_train_image_history_auxiliary_losses: list[float] = []
         for batch in train_loader:
             if global_step >= max_train_steps:
                 break
@@ -1136,6 +1184,8 @@ def main() -> None:
                 ranking_temperature=ranking_temperature,
                 text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
                 image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
+                text_history_auxiliary_loss_weight=current_text_history_auxiliary_loss_weight,
+                image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 target_item_ids=batch.get("target_item_ids"),
                 item_embedding_table=item_latent_table,
@@ -1167,9 +1217,19 @@ def main() -> None:
                     if "text_auxiliary_loss" in loss_dict
                     else "n/a"
                 ),
+                text_hist=(
+                    f"{loss_dict['text_history_auxiliary_loss'].detach().float().item():.4f}"
+                    if "text_history_auxiliary_loss" in loss_dict
+                    else "n/a"
+                ),
                 image_aux=(
                     f"{loss_dict['image_auxiliary_loss'].detach().float().item():.4f}"
                     if "image_auxiliary_loss" in loss_dict
+                    else "n/a"
+                ),
+                image_hist=(
+                    f"{loss_dict['image_history_auxiliary_loss'].detach().float().item():.4f}"
+                    if "image_history_auxiliary_loss" in loss_dict
                     else "n/a"
                 ),
                 lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
@@ -1185,8 +1245,16 @@ def main() -> None:
                     msg += f" rank={loss_dict['ranking_loss'].detach().float().item():.6f}"
                 if "text_auxiliary_loss" in loss_dict:
                     msg += f" text_aux={loss_dict['text_auxiliary_loss'].detach().float().item():.6f}"
+                if "text_history_auxiliary_loss" in loss_dict:
+                    msg += (
+                        f" text_hist_aux={loss_dict['text_history_auxiliary_loss'].detach().float().item():.6f}"
+                    )
                 if "image_auxiliary_loss" in loss_dict:
                     msg += f" image_aux={loss_dict['image_auxiliary_loss'].detach().float().item():.6f}"
+                if "image_history_auxiliary_loss" in loss_dict:
+                    msg += (
+                        f" image_hist_aux={loss_dict['image_history_auxiliary_loss'].detach().float().item():.6f}"
+                    )
                 maybe_print(accelerator, msg)
 
             gathered_total = accelerator.gather_for_metrics(loss.detach().reshape(1))
@@ -1206,6 +1274,16 @@ def main() -> None:
                     loss_dict["image_auxiliary_loss"].detach().reshape(1)
                 )
                 epoch_train_image_auxiliary_losses.append(float(gathered_image_aux.mean().item()))
+            if "text_history_auxiliary_loss" in loss_dict:
+                gathered_text_history_aux = accelerator.gather_for_metrics(
+                    loss_dict["text_history_auxiliary_loss"].detach().reshape(1)
+                )
+                epoch_train_text_history_auxiliary_losses.append(float(gathered_text_history_aux.mean().item()))
+            if "image_history_auxiliary_loss" in loss_dict:
+                gathered_image_history_aux = accelerator.gather_for_metrics(
+                    loss_dict["image_history_auxiliary_loss"].detach().reshape(1)
+                )
+                epoch_train_image_history_auxiliary_losses.append(float(gathered_image_history_aux.mean().item()))
 
             if eval_steps and valid_loader is not None and global_step % int(eval_steps) == 0:
                 metrics = evaluate(
@@ -1219,6 +1297,8 @@ def main() -> None:
                     ranking_temperature=ranking_temperature,
                     text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
                     image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
+                    text_history_auxiliary_loss_weight=current_text_history_auxiliary_loss_weight,
+                    image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                     auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                     desc=f"Eval@{global_step}",
                 )
@@ -1287,6 +1367,14 @@ def main() -> None:
             epoch_metrics["image_auxiliary_loss"] = float(
                 sum(epoch_train_image_auxiliary_losses) / len(epoch_train_image_auxiliary_losses)
             )
+        if epoch_train_text_history_auxiliary_losses:
+            epoch_metrics["text_history_auxiliary_loss"] = float(
+                sum(epoch_train_text_history_auxiliary_losses) / len(epoch_train_text_history_auxiliary_losses)
+            )
+        if epoch_train_image_history_auxiliary_losses:
+            epoch_metrics["image_history_auxiliary_loss"] = float(
+                sum(epoch_train_image_history_auxiliary_losses) / len(epoch_train_image_history_auxiliary_losses)
+            )
         if epoch_metrics:
             maybe_print(
                 accelerator,
@@ -1320,6 +1408,8 @@ def main() -> None:
                 ranking_temperature=ranking_temperature,
                 text_auxiliary_loss_weight=current_text_auxiliary_loss_weight,
                 image_auxiliary_loss_weight=current_image_auxiliary_loss_weight,
+                text_history_auxiliary_loss_weight=current_text_history_auxiliary_loss_weight,
+                image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 desc=f"EvalEpoch@{completed_epoch}",
             )
@@ -1380,6 +1470,18 @@ def main() -> None:
             epoch_value=final_epoch_for_aux,
             modality_key="image",
         )
+        final_text_history_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=text_history_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=final_epoch_for_aux,
+            modality_key="text_history",
+        )
+        final_image_history_auxiliary_loss_weight = resolve_auxiliary_weight_for_epoch(
+            default_weight=image_history_auxiliary_loss_weight,
+            curriculum_cfg=auxiliary_retrieval_curriculum_cfg,
+            epoch_value=final_epoch_for_aux,
+            modality_key="image_history",
+        )
         final_metrics = evaluate(
             accelerator=accelerator,
             model=model,
@@ -1391,6 +1493,8 @@ def main() -> None:
             ranking_temperature=ranking_temperature,
             text_auxiliary_loss_weight=final_text_auxiliary_loss_weight,
             image_auxiliary_loss_weight=final_image_auxiliary_loss_weight,
+            text_history_auxiliary_loss_weight=final_text_history_auxiliary_loss_weight,
+            image_history_auxiliary_loss_weight=final_image_history_auxiliary_loss_weight,
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             desc="Final Eval",
         )
