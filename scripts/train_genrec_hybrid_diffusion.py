@@ -9,6 +9,7 @@ import math
 import re
 import sys
 from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -451,6 +452,131 @@ def evaluate(
     return metrics
 
 
+class RetrievalMetricTracker:
+    def __init__(self, topk_list: List[int]) -> None:
+        self.topk_list = topk_list
+        self.total = 0
+        self.sums: Dict[str, float] = {"mean_rank": 0.0}
+        for k in topk_list:
+            self.sums[f"hit@{k}"] = 0.0
+            self.sums[f"recall@{k}"] = 0.0
+            self.sums[f"mrr@{k}"] = 0.0
+            self.sums[f"ndcg@{k}"] = 0.0
+
+    def update(self, ranks: torch.Tensor) -> None:
+        ranks = ranks.detach().cpu().to(torch.long)
+        batch_size = int(ranks.shape[0])
+        if batch_size == 0:
+            return
+        self.total += batch_size
+        self.sums["mean_rank"] += float(ranks.float().sum().item())
+        for k in self.topk_list:
+            hit = (ranks <= k).float()
+            ndcg = torch.where(
+                ranks <= k,
+                1.0 / torch.log2(ranks.float() + 1.0),
+                torch.zeros_like(ranks, dtype=torch.float32),
+            )
+            mrr = torch.where(
+                ranks <= k,
+                1.0 / ranks.float(),
+                torch.zeros_like(ranks, dtype=torch.float32),
+            )
+            self.sums[f"hit@{k}"] += float(hit.sum().item())
+            self.sums[f"recall@{k}"] += float(hit.sum().item())
+            self.sums[f"mrr@{k}"] += float(mrr.sum().item())
+            self.sums[f"ndcg@{k}"] += float(ndcg.sum().item())
+
+    def compute(self) -> Dict[str, float]:
+        if self.total == 0:
+            return {}
+        return {name: value / self.total for name, value in self.sums.items()}
+
+
+def exclude_history_items_from_scores(
+    scores: torch.Tensor,
+    history_item_ids: torch.Tensor,
+    history_masks: torch.Tensor,
+    target_item_ids: torch.Tensor,
+) -> torch.Tensor:
+    scores = scores.clone()
+    target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
+    valid_history = history_masks & history_item_ids.ge(0)
+    if valid_history.any():
+        row_idx = torch.arange(scores.shape[0], device=scores.device).unsqueeze(1).expand_as(history_item_ids)
+        col_idx = history_item_ids.clamp_min(0)
+        scores[row_idx[valid_history], col_idx[valid_history]] = -torch.inf
+        scores.scatter_(1, target_item_ids.unsqueeze(1), target_scores)
+    return scores
+
+
+@torch.no_grad()
+def evaluate_retrieval(
+    *,
+    accelerator: Accelerator,
+    model: GenRecHybridDiffusionRunner,
+    dataloader: DataLoader | None,
+    item_latent_table: torch.Tensor,
+    normalize_target_latent: bool,
+    num_inference_steps: int,
+    topk_list: List[int],
+    exclude_history_items: bool,
+    desc: str,
+) -> dict[str, float]:
+    if dataloader is None:
+        return {}
+
+    model.eval()
+    tracker = RetrievalMetricTracker(topk_list)
+    max_k = max(topk_list)
+    progress_bar = tqdm(
+        dataloader,
+        disable=not accelerator.is_local_main_process,
+        desc=desc,
+    )
+    normalized_item_latent_table = (
+        F.normalize(item_latent_table.float(), dim=-1)
+        if normalize_target_latent
+        else item_latent_table.float()
+    )
+    for batch in progress_bar:
+        sampled_latents = model.sample_latents(
+            batch,
+            num_inference_steps=num_inference_steps,
+        ).float()
+        if normalize_target_latent:
+            sampled_latents = F.normalize(sampled_latents, dim=-1)
+
+        scores = sampled_latents @ normalized_item_latent_table.t()
+        target_item_ids = batch["target_item_ids"].to(device=scores.device, dtype=torch.long)
+        history_item_ids = batch["history_item_ids"].to(device=scores.device, dtype=torch.long)
+        history_masks = batch["history_masks"].to(device=scores.device, dtype=torch.bool)
+        if exclude_history_items:
+            scores = exclude_history_items_from_scores(
+                scores=scores,
+                history_item_ids=history_item_ids,
+                history_masks=history_masks,
+                target_item_ids=target_item_ids,
+            )
+
+        target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
+        ranks = 1 + (scores > target_scores).sum(dim=1)
+        gathered_ranks = accelerator.gather_for_metrics(ranks)
+        if accelerator.is_main_process:
+            tracker.update(gathered_ranks)
+            running_metrics = tracker.compute()
+            postfix = {"mean_rank": f"{running_metrics.get('mean_rank', 0.0):.2f}"}
+            for k in topk_list:
+                postfix[f"ndcg@{k}"] = f"{running_metrics.get(f'ndcg@{k}', 0.0):.4f}"
+            progress_bar.set_postfix(postfix)
+
+        if max_k > 0:
+            torch.topk(scores, k=max_k, dim=1)
+
+    model.train()
+    return tracker.compute()
+
+
 def save_checkpoint(
     *,
     accelerator: Accelerator,
@@ -767,6 +893,16 @@ def main() -> None:
     early_stopping_min_delta = float(early_stopping_cfg.get("min_delta", 0.0))
     early_stopping_warmup_epochs = int(early_stopping_cfg.get("warmup_epochs", 0))
     save_best_snapshot_enabled = bool(early_stopping_cfg.get("save_best_snapshot", True))
+    retrieval_validation_cfg = training_cfg.get("retrieval_validation", {})
+    retrieval_validation_enabled = bool(retrieval_validation_cfg.get("enabled", False))
+    retrieval_validation_num_inference_steps = int(retrieval_validation_cfg.get("num_inference_steps", 50))
+    retrieval_validation_topk_cfg = retrieval_validation_cfg.get("topk", [5, 10, 20])
+    retrieval_validation_topk = sorted({int(k) for k in retrieval_validation_topk_cfg})
+    if not retrieval_validation_topk:
+        retrieval_validation_topk = [20]
+    retrieval_validation_exclude_history_items = bool(
+        retrieval_validation_cfg.get("exclude_history_items", True)
+    )
     use_popularity = bool(conditioning_cfg.get("use_popularity", False))
     popularity_num_buckets = int(conditioning_cfg.get("popularity_num_buckets", 16))
     popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
@@ -982,6 +1118,12 @@ def main() -> None:
             "min_delta": early_stopping_min_delta,
             "warmup_epochs": early_stopping_warmup_epochs,
             "save_best_snapshot": save_best_snapshot_enabled,
+        },
+        "retrieval_validation": {
+            "enabled": retrieval_validation_enabled,
+            "num_inference_steps": retrieval_validation_num_inference_steps,
+            "topk": retrieval_validation_topk,
+            "exclude_history_items": retrieval_validation_exclude_history_items,
         },
         "tail_sampler": {
             "enabled": tail_sampler_enabled,
@@ -1413,6 +1555,19 @@ def main() -> None:
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 desc=f"EvalEpoch@{completed_epoch}",
             )
+            if retrieval_validation_enabled:
+                retrieval_metrics = evaluate_retrieval(
+                    accelerator=accelerator,
+                    model=model,
+                    dataloader=valid_loader,
+                    item_latent_table=item_latent_table,
+                    normalize_target_latent=normalize_target_latent,
+                    num_inference_steps=retrieval_validation_num_inference_steps,
+                    topk_list=retrieval_validation_topk,
+                    exclude_history_items=retrieval_validation_exclude_history_items,
+                    desc=f"EvalRetrievalEpoch@{completed_epoch}",
+                )
+                metrics.update(retrieval_metrics)
             if metrics:
                 maybe_print(
                     accelerator,
@@ -1498,6 +1653,19 @@ def main() -> None:
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             desc="Final Eval",
         )
+        if retrieval_validation_enabled:
+            final_retrieval_metrics = evaluate_retrieval(
+                accelerator=accelerator,
+                model=model,
+                dataloader=valid_loader,
+                item_latent_table=item_latent_table,
+                normalize_target_latent=normalize_target_latent,
+                num_inference_steps=retrieval_validation_num_inference_steps,
+                topk_list=retrieval_validation_topk,
+                exclude_history_items=retrieval_validation_exclude_history_items,
+                desc="Final Retrieval Eval",
+            )
+            final_metrics.update(final_retrieval_metrics)
         if final_metrics:
             maybe_print(
                 accelerator,
