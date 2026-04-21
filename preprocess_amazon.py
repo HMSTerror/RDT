@@ -293,6 +293,14 @@ def choose_image_url(meta: dict) -> str:
                 candidates.append(value.strip())
             elif isinstance(value, list):
                 candidates.extend([str(x).strip() for x in value if str(x).strip() and str(x).strip() != "None"])
+    elif isinstance(images, list):
+        for image_record in images:
+            if not isinstance(image_record, dict):
+                continue
+            for key in ("hi_res", "large", "thumb", "large_image_url", "medium_image_url", "small_image_url"):
+                value = image_record.get(key)
+                if isinstance(value, str) and value.strip() and value.strip() != "None":
+                    candidates.append(value.strip())
 
     return candidates[0] if candidates else ""
 
