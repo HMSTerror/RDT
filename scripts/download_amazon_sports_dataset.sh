@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 : "${DATA_ROOT:=data/Amazon_Sports_And_Outdoors}"
 : "${REVIEWS_URL:=https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Sports_and_Outdoors_5.json.gz}"
-: "${META_URL:=https://jmcauley.ucsd.edu/pml_data/meta_Sports_and_Outdoors.json.gz}"
+: "${META_URL:=http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/meta_Sports_and_Outdoors.json.gz}"
 : "${FORCE_DOWNLOAD:=0}"
 : "${INSECURE_SKIP_TLS_VERIFY:=0}"
 : "${CA_BUNDLE:=}"
