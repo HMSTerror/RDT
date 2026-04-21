@@ -51,8 +51,19 @@ extract_gzip_to_json() {
   local gzip_path="$1"
   local json_path="$2"
 
-  python -c "import gzip, shutil; from pathlib import Path; src=Path(r'''${gzip_path}'''); dst=Path(r'''${json_path}'''); dst.parent.mkdir(parents=True, exist_ok=True); \
-with gzip.open(src, 'rb') as fin, open(dst, 'wb') as fout: shutil.copyfileobj(fin, fout)"
+  GZIP_PATH="${gzip_path}" JSON_PATH="${json_path}" python - <<'PY'
+import gzip
+import os
+import shutil
+from pathlib import Path
+
+src = Path(os.environ["GZIP_PATH"])
+dst = Path(os.environ["JSON_PATH"])
+dst.parent.mkdir(parents=True, exist_ok=True)
+
+with gzip.open(src, "rb") as fin, open(dst, "wb") as fout:
+    shutil.copyfileobj(fin, fout)
+PY
 }
 
 ensure_json_file() {
