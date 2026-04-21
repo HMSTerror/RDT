@@ -45,6 +45,7 @@ from preprocess_amazon import (  # noqa: E402
     build_contiguous_mappings,
     build_item_map_from_sequences,
     build_user_sequences,
+    extract_item_id,
     load_review_interactions,
     select_item_universe_sequences,
 )
@@ -98,6 +99,14 @@ def choose_image_url(meta: dict) -> str:
             candidates.append(value.strip())
         elif isinstance(value, list):
             candidates.extend([str(x).strip() for x in value if str(x).strip()])
+    images = meta.get("images")
+    if isinstance(images, dict):
+        for key in ("hi_res", "large", "thumb"):
+            value = images.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+            elif isinstance(value, list):
+                candidates.extend([str(x).strip() for x in value if str(x).strip() and str(x).strip() != "None"])
     return candidates[0] if candidates else ""
 
 
@@ -312,7 +321,7 @@ def load_meta_image_lookup(
     target_set = set(target_item_ids)
     lookup: Dict[str, dict] = {}
     for record in iter_json_records(meta_path, desc="Reading metadata for image lookup"):
-        item_id = clean_text(record.get("asin", ""))
+        item_id = extract_item_id(record)
         if not item_id or item_id not in target_set:
             continue
         image_url = choose_image_url(record)

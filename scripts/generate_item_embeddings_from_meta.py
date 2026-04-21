@@ -46,6 +46,7 @@ from preprocess_amazon import (  # noqa: E402
     build_item_map_from_sequences,
     build_user_sequences,
     clean_text,
+    extract_item_id,
     format_categories,
     iter_json_records,
     load_review_interactions,
@@ -181,16 +182,31 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "..."
 
 
+def merge_text_fields(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return clean_text(" ".join(str(x) for x in value if x))
+    return clean_text(value)
+
+
 def build_item_text(record: dict, *, item_id: str, max_description_chars: int) -> str:
     title = clean_text(record.get("title", ""))
-    brand = clean_text(record.get("brand", ""))
+    brand = clean_text(record.get("brand", "")) or clean_text(record.get("store", ""))
+    author = clean_text(record.get("author", ""))
+    subtitle = clean_text(record.get("subtitle", ""))
+    main_category = clean_text(record.get("main_category", ""))
     categories = format_categories(record.get("categories"))
     description = truncate_text(
-        clean_text(record.get("description", "")),
+        merge_text_fields(record.get("description", "")),
         max_description_chars,
     )
     feature = truncate_text(
-        clean_text(record.get("feature", "")),
+        merge_text_fields(record.get("feature", "")) or merge_text_fields(record.get("features", "")),
+        max_description_chars,
+    )
+    details = truncate_text(
+        clean_text(record.get("details", "")),
         max_description_chars,
     )
 
@@ -199,12 +215,20 @@ def build_item_text(record: dict, *, item_id: str, max_description_chars: int) -
         fields.append(f"title: {title}")
     if brand:
         fields.append(f"brand: {brand}")
+    if author:
+        fields.append(f"author: {author}")
+    if subtitle:
+        fields.append(f"subtitle: {subtitle}")
+    if main_category:
+        fields.append(f"main_category: {main_category}")
     if categories:
         fields.append(f"categories: {categories}")
     if description:
         fields.append(f"description: {description}")
     if feature:
         fields.append(f"feature: {feature}")
+    if details:
+        fields.append(f"details: {details}")
 
     return " ; ".join(fields) or item_id
 
@@ -219,7 +243,7 @@ def load_item_texts(
     item_text_map: Dict[str, str] = {}
 
     for record in iter_json_records(meta_path, desc="Reading metadata for item embeddings"):
-        item_id = clean_text(record.get("asin", ""))
+        item_id = extract_item_id(record)
         if not item_id or item_id not in target_set:
             continue
         item_text_map[item_id] = build_item_text(

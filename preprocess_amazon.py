@@ -229,6 +229,40 @@ def clean_text(value) -> str:
     return " ".join(str(value).split())
 
 
+def extract_item_id(record: dict) -> str:
+    """
+    Prefer the stable product identifier used by the dataset version.
+
+    Amazon Reviews'23 uses `parent_asin` as the canonical product id for
+    matching reviews with metadata. Older Amazon dumps typically only expose
+    `asin`.
+    """
+    return clean_text(record.get("parent_asin", "")) or clean_text(record.get("asin", ""))
+
+
+def extract_user_id(record: dict) -> str:
+    """
+    Support both legacy Amazon reviewer ids and Amazon Reviews'23 user ids.
+    """
+    return clean_text(record.get("user_id", "")) or clean_text(record.get("reviewerID", ""))
+
+
+def extract_timestamp(record: dict) -> int:
+    """
+    Support both legacy unixReviewTime and Amazon Reviews'23 millisecond
+    timestamps.
+    """
+    for key in ("timestamp", "sort_timestamp", "unixReviewTime"):
+        value = record.get(key, 0)
+        try:
+            if value is None or value == "":
+                continue
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def format_categories(categories) -> str:
     if not categories:
         return ""
@@ -251,20 +285,26 @@ def choose_image_url(meta: dict) -> str:
         elif isinstance(value, list):
             candidates.extend([str(x).strip() for x in value if str(x).strip()])
 
+    images = meta.get("images")
+    if isinstance(images, dict):
+        for key in ("hi_res", "large", "thumb"):
+            value = images.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+            elif isinstance(value, list):
+                candidates.extend([str(x).strip() for x in value if str(x).strip() and str(x).strip() != "None"])
+
     return candidates[0] if candidates else ""
 
 
 def load_review_interactions(reviews_path: Path) -> List[Tuple[str, str, int]]:
     interactions: List[Tuple[str, str, int]] = []
     for record in iter_json_records(reviews_path, desc="Reading reviews"):
-        user_id = clean_text(record.get("reviewerID", ""))
-        item_id = clean_text(record.get("asin", ""))
+        user_id = extract_user_id(record)
+        item_id = extract_item_id(record)
         if not user_id or not item_id:
             continue
-        try:
-            timestamp = int(record.get("unixReviewTime", 0) or 0)
-        except (TypeError, ValueError):
-            timestamp = 0
+        timestamp = extract_timestamp(record)
         interactions.append((user_id, item_id, timestamp))
     return interactions
 
@@ -354,7 +394,7 @@ def load_item_meta(meta_path: Path, target_items: Sequence[str]) -> Dict[str, di
     target_set = set(target_items)
     meta_dict: Dict[str, dict] = {}
     for record in iter_json_records(meta_path, desc="Reading metadata"):
-        item_id = clean_text(record.get("asin", ""))
+        item_id = extract_item_id(record)
         if not item_id or item_id not in target_set:
             continue
         meta_dict[item_id] = {
