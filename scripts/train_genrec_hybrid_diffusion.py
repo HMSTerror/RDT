@@ -526,6 +526,7 @@ def evaluate_retrieval(
     if dataloader is None:
         return {}
 
+    unwrapped_model = accelerator.unwrap_model(model)
     model.eval()
     tracker = RetrievalMetricTracker(topk_list)
     max_k = max(topk_list)
@@ -540,7 +541,7 @@ def evaluate_retrieval(
         else item_latent_table.float()
     )
     for batch in progress_bar:
-        sampled_latents = model.sample_latents(
+        sampled_latents = unwrapped_model.sample_latents(
             batch,
             num_inference_steps=num_inference_steps,
         ).float()
