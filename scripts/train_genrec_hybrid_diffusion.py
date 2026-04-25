@@ -563,8 +563,8 @@ def evaluate_retrieval(
         target_scores = scores.gather(1, target_item_ids.unsqueeze(1))
         ranks = 1 + (scores > target_scores).sum(dim=1)
         gathered_ranks = accelerator.gather_for_metrics(ranks)
+        tracker.update(gathered_ranks)
         if accelerator.is_main_process:
-            tracker.update(gathered_ranks)
             running_metrics = tracker.compute()
             postfix = {"mean_rank": f"{running_metrics.get('mean_rank', 0.0):.2f}"}
             for k in topk_list:
