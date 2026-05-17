@@ -219,6 +219,19 @@ def infer_embedding_dim(path_like: str | None) -> int | None:
     return int(array.shape[1])
 
 
+def resolve_lookup_config(representation_cfg: dict) -> dict[str, float | str]:
+    lookup_cfg = representation_cfg.get("lookup", {})
+    mode = str(lookup_cfg.get("mode", "fixed")).strip().lower()
+    if mode not in {"fixed", "residual", "trainable"}:
+        raise ValueError(f"Unsupported representation.lookup.mode: {mode}")
+    return {
+        "mode": mode,
+        "residual_scale": float(lookup_cfg.get("residual_scale", 1.0)),
+        "delta_init_std": float(lookup_cfg.get("delta_init_std", 0.0)),
+        "regularization_weight": float(lookup_cfg.get("regularization_weight", 0.0)),
+    }
+
+
 def load_item_latent_table(path_like: str | Path) -> torch.Tensor:
     path = Path(path_like)
     if not path.exists():
@@ -265,7 +278,6 @@ def build_dataloader(
     text_embedding_path: str | None,
     image_embedding_path: str | None,
     cf_embedding_path: str | None,
-    target_latent_path: str | Path | None,
     batch_size: int,
     num_workers: int,
 ):
@@ -275,7 +287,7 @@ def build_dataloader(
         text_embedding_path=text_embedding_path,
         image_embedding_path=image_embedding_path,
         cf_embedding_path=cf_embedding_path,
-        target_latent_path=target_latent_path,
+        target_latent_path=None,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -632,6 +644,7 @@ def main() -> None:
     )
     image_embedding_path = conditioning_cfg.get("image_embedding_path") if use_image else None
     cf_embedding_path = conditioning_cfg.get("cf_embedding_path") if conditioning_cfg.get("use_cf", False) else None
+    lookup_cfg = resolve_lookup_config(representation_cfg)
     use_popularity = bool(conditioning_cfg.get("use_popularity", False))
     popularity_num_buckets = int(conditioning_cfg.get("popularity_num_buckets", 16))
     popularity_cond_dim = int(conditioning_cfg.get("popularity_cond_dim", 32))
@@ -645,7 +658,6 @@ def main() -> None:
         text_embedding_path=text_embedding_path,
         image_embedding_path=image_embedding_path,
         cf_embedding_path=cf_embedding_path,
-        target_latent_path=target_latent_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
@@ -657,11 +669,11 @@ def main() -> None:
     image_cond_dim = infer_embedding_dim(image_embedding_path)
     cf_cond_dim = infer_embedding_dim(cf_embedding_path)
 
-    item_latent_table = load_item_latent_table(target_latent_path)
-    latent_dim = int(representation_cfg.get("latent_dim", item_latent_table.shape[1]))
-    if item_latent_table.shape[1] != latent_dim:
+    base_item_latent_table = load_item_latent_table(target_latent_path)
+    latent_dim = int(representation_cfg.get("latent_dim", base_item_latent_table.shape[1]))
+    if base_item_latent_table.shape[1] != latent_dim:
         raise ValueError(
-            f"Latent dimension mismatch: table has {item_latent_table.shape[1]} dims but config sets {latent_dim}."
+            f"Latent dimension mismatch: table has {base_item_latent_table.shape[1]} dims but config sets {latent_dim}."
         )
     normalize_target_latent = bool(representation_cfg.get("normalize_target_latent", True))
 
@@ -670,7 +682,7 @@ def main() -> None:
         train_item_frequencies = load_split_target_frequencies(
             tokenized_root=tokenized_root,
             split=train_split,
-            num_items=item_latent_table.shape[0],
+            num_items=base_item_latent_table.shape[0],
         )
         popularity_bucket_ids = torch.from_numpy(
             build_popularity_bucket_ids(
@@ -707,15 +719,19 @@ def main() -> None:
         use_popularity_history=use_popularity_history,
         use_popularity_pooled=use_popularity_pooled,
         **conditioning_strategy_kwargs,
+        item_lookup_table=base_item_latent_table,
+        item_lookup_mode=str(lookup_cfg["mode"]),
+        item_lookup_residual_scale=float(lookup_cfg["residual_scale"]),
+        item_lookup_delta_init_std=float(lookup_cfg["delta_init_std"]),
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
     load_model_checkpoint(model, args.checkpoint)
     model.to(device)
     model.eval()
 
-    item_latent_table = item_latent_table.to(device=device, dtype=torch.float32)
-    if normalize_target_latent:
-        item_latent_table = F.normalize(item_latent_table, dim=-1)
+    current_item_latent_table = model.get_item_lookup_table(
+        normalize=normalize_target_latent,
+    ).to(device=device, dtype=torch.float32)
 
     item_id_mapping_source = "buffer_item_map"
     try:
@@ -723,13 +739,13 @@ def main() -> None:
             buffer_root=buffer_root,
             split_for_item_map=train_split,
         )
-        if len(idx_to_item) != item_latent_table.shape[0]:
+        if len(idx_to_item) != base_item_latent_table.shape[0]:
             raise ValueError(
-                f"Item map size ({len(idx_to_item)}) does not match latent table rows ({item_latent_table.shape[0]})."
+                f"Item map size ({len(idx_to_item)}) does not match latent table rows ({base_item_latent_table.shape[0]})."
             )
     except (FileNotFoundError, ValueError) as exc:
         item_id_mapping_source = "synthetic_item_idx"
-        idx_to_item = build_fallback_item_index_mapping(item_latent_table.shape[0])
+        idx_to_item = build_fallback_item_index_mapping(base_item_latent_table.shape[0])
         print(f"[warn] {exc}")
         print(
             "[warn] Falling back to synthetic item identifiers because the buffer item_map "
@@ -740,7 +756,7 @@ def main() -> None:
     item_frequencies = load_split_target_frequencies(
         tokenized_root=tokenized_root,
         split=args.frequency_source_split,
-        num_items=item_latent_table.shape[0],
+        num_items=base_item_latent_table.shape[0],
     )
     item_group_ids, grouping_metadata = build_popularity_groups(
         item_frequencies,
@@ -783,7 +799,7 @@ def main() -> None:
         if normalize_target_latent:
             sampled_latents = F.normalize(sampled_latents, dim=-1)
 
-        scores = sampled_latents @ item_latent_table.t()
+        scores = sampled_latents @ current_item_latent_table.t()
 
         target_item_ids = batch["target_item_ids"].to(device=device, dtype=torch.long)
         history_item_ids = batch["history_item_ids"].to(device=device, dtype=torch.long)
@@ -889,9 +905,15 @@ def main() -> None:
             "tokenized_root": str(tokenized_root),
             "buffer_root": str(buffer_root),
             "target_latent_path": str(target_latent_path),
+            "representation_lookup": {
+                "mode": str(lookup_cfg["mode"]),
+                "residual_scale": float(lookup_cfg["residual_scale"]),
+                "delta_init_std": float(lookup_cfg["delta_init_std"]),
+                "regularization_weight": float(lookup_cfg["regularization_weight"]),
+            },
             "item_id_mapping_source": item_id_mapping_source,
             "evaluated_samples": int(overall_tracker.total),
-            "candidate_items": int(item_latent_table.shape[0]),
+            "candidate_items": int(current_item_latent_table.shape[0]),
             "topk": topk_list,
             "exclude_history_items": bool(args.exclude_history_items),
             "num_inference_steps": int(args.num_inference_steps),

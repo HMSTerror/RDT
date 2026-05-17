@@ -16,6 +16,14 @@ representation:
   target_latent_path: data/Amazon_Music_And_Instruments/item_embeddings_fused.npy
   latent_dim: 128
   normalize_target_latent: true
+  lookup:
+    # fixed: frozen base table
+    # residual: base table + learnable delta
+    # trainable: fully learnable table initialized from base table
+    mode: fixed
+    residual_scale: 1.0
+    delta_init_std: 0.0
+    regularization_weight: 0.0
 
 tokenization:
   enabled: true

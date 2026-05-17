@@ -163,6 +163,19 @@ def resolve_training_value(cli_value, config_section: dict, key: str, default):
     return config_section.get(key, default)
 
 
+def resolve_lookup_config(representation_cfg: dict) -> dict[str, float | str]:
+    lookup_cfg = representation_cfg.get("lookup", {})
+    mode = str(lookup_cfg.get("mode", "fixed")).strip().lower()
+    if mode not in {"fixed", "residual", "trainable"}:
+        raise ValueError(f"Unsupported representation.lookup.mode: {mode}")
+    return {
+        "mode": mode,
+        "residual_scale": float(lookup_cfg.get("residual_scale", 1.0)),
+        "delta_init_std": float(lookup_cfg.get("delta_init_std", 0.0)),
+        "regularization_weight": float(lookup_cfg.get("regularization_weight", 0.0)),
+    }
+
+
 def resolve_auxiliary_weight_for_epoch(
     *,
     default_weight: float,
@@ -331,11 +344,13 @@ def prepare_target_latents(
     normalize: bool,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if "target_item_latent" in batch:
-        latents = batch["target_item_latent"].to(device=item_latent_table.device, dtype=dtype)
-    else:
+    if "target_item_ids" in batch:
         target_item_ids = batch["target_item_ids"].to(device=item_latent_table.device, dtype=torch.long)
         latents = item_latent_table[target_item_ids].to(dtype=dtype)
+    elif "target_item_latent" in batch:
+        latents = batch["target_item_latent"].to(device=item_latent_table.device, dtype=dtype)
+    else:
+        raise KeyError("Batch must contain either `target_item_ids` or `target_item_latent`.")
     if normalize:
         latents = F.normalize(latents.float(), dim=-1).to(dtype=dtype)
     return latents
@@ -347,7 +362,6 @@ def evaluate(
     accelerator: Accelerator,
     model: GenRecHybridDiffusionRunner,
     dataloader: DataLoader | None,
-    item_latent_table: torch.Tensor,
     normalize_target_latent: bool,
     diffusion_loss_weight: float,
     ranking_loss_weight: float,
@@ -357,6 +371,7 @@ def evaluate(
     text_history_auxiliary_loss_weight: float,
     image_history_auxiliary_loss_weight: float,
     auxiliary_ranking_temperature: float | None,
+    item_lookup_regularization_weight: float,
     desc: str,
 ) -> dict[str, float]:
     if dataloader is None:
@@ -370,6 +385,7 @@ def evaluate(
     image_auxiliary_losses: list[float] = []
     text_history_auxiliary_losses: list[float] = []
     image_history_auxiliary_losses: list[float] = []
+    item_lookup_regularization_losses: list[float] = []
     total_losses: list[float] = []
     progress_bar = tqdm(
         dataloader,
@@ -377,9 +393,10 @@ def evaluate(
         desc=desc,
     )
     for batch in progress_bar:
+        current_item_latent_table = base_model.get_item_lookup_table()
         target_latents = prepare_target_latents(
             batch=batch,
-            item_latent_table=item_latent_table,
+            item_latent_table=current_item_latent_table,
             normalize=normalize_target_latent,
             dtype=base_model.token_embed.weight.dtype,
         )
@@ -403,7 +420,8 @@ def evaluate(
             image_history_auxiliary_loss_weight=image_history_auxiliary_loss_weight,
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
             target_item_ids=batch.get("target_item_ids"),
-            item_embedding_table=item_latent_table,
+            item_embedding_table=current_item_latent_table,
+            item_lookup_regularization_weight=item_lookup_regularization_weight,
         )
         gathered_total = accelerator.gather_for_metrics(loss_dict["loss"].detach().reshape(1))
         gathered_diff = accelerator.gather_for_metrics(loss_dict["diffusion_loss"].detach().reshape(1))
@@ -428,6 +446,11 @@ def evaluate(
                 loss_dict["image_history_auxiliary_loss"].detach().reshape(1)
             )
             image_history_auxiliary_losses.append(float(gathered_image_history_aux.mean().item()))
+        if "item_lookup_regularization_loss" in loss_dict:
+            gathered_lookup_reg = accelerator.gather_for_metrics(
+                loss_dict["item_lookup_regularization_loss"].detach().reshape(1)
+            )
+            item_lookup_regularization_losses.append(float(gathered_lookup_reg.mean().item()))
 
     model.train()
     metrics = {}
@@ -448,6 +471,10 @@ def evaluate(
     if image_history_auxiliary_losses:
         metrics["image_history_auxiliary_loss"] = float(
             sum(image_history_auxiliary_losses) / len(image_history_auxiliary_losses)
+        )
+    if item_lookup_regularization_losses:
+        metrics["item_lookup_regularization_loss"] = float(
+            sum(item_lookup_regularization_losses) / len(item_lookup_regularization_losses)
         )
     return metrics
 
@@ -516,7 +543,6 @@ def evaluate_retrieval(
     accelerator: Accelerator,
     model: GenRecHybridDiffusionRunner,
     dataloader: DataLoader | None,
-    item_latent_table: torch.Tensor,
     normalize_target_latent: bool,
     num_inference_steps: int,
     topk_list: List[int],
@@ -535,6 +561,7 @@ def evaluate_retrieval(
         disable=not accelerator.is_local_main_process,
         desc=desc,
     )
+    item_latent_table = unwrapped_model.get_item_lookup_table()
     normalized_item_latent_table = (
         F.normalize(item_latent_table.float(), dim=-1)
         if normalize_target_latent
@@ -793,6 +820,7 @@ def main() -> None:
             f"Latent dimension mismatch: table has {item_latent_table.shape[1]} dims but config sets {latent_dim}."
         )
     normalize_target_latent = bool(representation_cfg.get("normalize_target_latent", True))
+    lookup_cfg = resolve_lookup_config(representation_cfg)
 
     text_embedding_path = conditioning_cfg.get("text_embedding_path") if conditioning_cfg.get("use_text", False) else None
     use_image = bool(
@@ -809,7 +837,7 @@ def main() -> None:
         text_embedding_path=text_embedding_path,
         image_embedding_path=image_embedding_path,
         cf_embedding_path=cf_embedding_path,
-        target_latent_path=target_latent_path,
+        target_latent_path=None,
     )
 
     valid_dataset = None
@@ -821,7 +849,7 @@ def main() -> None:
             text_embedding_path=text_embedding_path,
             image_embedding_path=image_embedding_path,
             cf_embedding_path=cf_embedding_path,
-            target_latent_path=target_latent_path,
+            target_latent_path=None,
         )
 
     train_batch_size = int(resolve_training_value(args.train_batch_size, training_cfg, "batch_size", 16))
@@ -1006,6 +1034,10 @@ def main() -> None:
         use_cf_target=bool(conditioning_cfg.get("use_target_cf", False)),
         use_popularity_history=use_popularity_history,
         use_popularity_pooled=use_popularity_pooled,
+        item_lookup_table=item_latent_table,
+        item_lookup_mode=str(lookup_cfg["mode"]),
+        item_lookup_residual_scale=float(lookup_cfg["residual_scale"]),
+        item_lookup_delta_init_std=float(lookup_cfg["delta_init_std"]),
         **conditioning_strategy_kwargs,
         dropout=float(backbone_cfg.get("dropout", 0.0)),
     )
@@ -1046,7 +1078,6 @@ def main() -> None:
         num_training_steps=max_train_steps,
     )
 
-    item_latent_table = item_latent_table.to(device=accelerator.device, dtype=torch.float32)
     if ranking_item_weights is not None:
         ranking_item_weights = ranking_item_weights.to(device=accelerator.device, dtype=torch.float32)
     base_model = accelerator.unwrap_model(model)
@@ -1069,6 +1100,12 @@ def main() -> None:
         "target_latent_path": str(target_latent_path),
         "latent_dim": latent_dim,
         "normalize_target_latent": normalize_target_latent,
+        "lookup": {
+            "mode": str(lookup_cfg["mode"]),
+            "residual_scale": float(lookup_cfg["residual_scale"]),
+            "delta_init_std": float(lookup_cfg["delta_init_std"]),
+            "regularization_weight": float(lookup_cfg["regularization_weight"]),
+        },
         "train_batch_size": train_batch_size,
         "eval_batch_size": eval_batch_size,
         "learning_rate": learning_rate,
@@ -1300,13 +1337,14 @@ def main() -> None:
         epoch_train_image_auxiliary_losses: list[float] = []
         epoch_train_text_history_auxiliary_losses: list[float] = []
         epoch_train_image_history_auxiliary_losses: list[float] = []
+        epoch_train_item_lookup_regularization_losses: list[float] = []
         for batch in train_loader:
             if global_step >= max_train_steps:
                 break
 
             target_latents = prepare_target_latents(
                 batch=batch,
-                item_latent_table=item_latent_table,
+                item_latent_table=base_model.get_item_lookup_table(),
                 normalize=normalize_target_latent,
                 dtype=base_model.token_embed.weight.dtype,
             )
@@ -1331,12 +1369,13 @@ def main() -> None:
                 image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
                 target_item_ids=batch.get("target_item_ids"),
-                item_embedding_table=item_latent_table,
+                item_embedding_table=base_model.get_item_lookup_table(),
                 ranking_sample_weights=(
                     ranking_item_weights[batch["target_item_ids"]]
                     if ranking_item_weights is not None
                     else None
                 ),
+                item_lookup_regularization_weight=float(lookup_cfg["regularization_weight"]),
             )
             loss = loss_dict["loss"]
 
@@ -1375,6 +1414,11 @@ def main() -> None:
                     if "image_history_auxiliary_loss" in loss_dict
                     else "n/a"
                 ),
+                lookup_reg=(
+                    f"{loss_dict['item_lookup_regularization_loss'].detach().float().item():.4f}"
+                    if "item_lookup_regularization_loss" in loss_dict
+                    else "n/a"
+                ),
                 lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
             )
 
@@ -1397,6 +1441,10 @@ def main() -> None:
                 if "image_history_auxiliary_loss" in loss_dict:
                     msg += (
                         f" image_hist_aux={loss_dict['image_history_auxiliary_loss'].detach().float().item():.6f}"
+                    )
+                if "item_lookup_regularization_loss" in loss_dict:
+                    msg += (
+                        f" lookup_reg={loss_dict['item_lookup_regularization_loss'].detach().float().item():.6f}"
                     )
                 maybe_print(accelerator, msg)
 
@@ -1427,13 +1475,17 @@ def main() -> None:
                     loss_dict["image_history_auxiliary_loss"].detach().reshape(1)
                 )
                 epoch_train_image_history_auxiliary_losses.append(float(gathered_image_history_aux.mean().item()))
+            if "item_lookup_regularization_loss" in loss_dict:
+                gathered_lookup_reg = accelerator.gather_for_metrics(
+                    loss_dict["item_lookup_regularization_loss"].detach().reshape(1)
+                )
+                epoch_train_item_lookup_regularization_losses.append(float(gathered_lookup_reg.mean().item()))
 
             if eval_steps and valid_loader is not None and global_step % int(eval_steps) == 0:
                 metrics = evaluate(
                     accelerator=accelerator,
                     model=model,
                     dataloader=valid_loader,
-                    item_latent_table=item_latent_table,
                     normalize_target_latent=normalize_target_latent,
                     diffusion_loss_weight=diffusion_loss_weight,
                     ranking_loss_weight=ranking_loss_weight,
@@ -1443,6 +1495,7 @@ def main() -> None:
                     text_history_auxiliary_loss_weight=current_text_history_auxiliary_loss_weight,
                     image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                     auxiliary_ranking_temperature=auxiliary_ranking_temperature,
+                    item_lookup_regularization_weight=float(lookup_cfg["regularization_weight"]),
                     desc=f"Eval@{global_step}",
                 )
                 if metrics:
@@ -1518,6 +1571,11 @@ def main() -> None:
             epoch_metrics["image_history_auxiliary_loss"] = float(
                 sum(epoch_train_image_history_auxiliary_losses) / len(epoch_train_image_history_auxiliary_losses)
             )
+        if epoch_train_item_lookup_regularization_losses:
+            epoch_metrics["item_lookup_regularization_loss"] = float(
+                sum(epoch_train_item_lookup_regularization_losses)
+                / len(epoch_train_item_lookup_regularization_losses)
+            )
         if epoch_metrics:
             maybe_print(
                 accelerator,
@@ -1544,7 +1602,6 @@ def main() -> None:
                 accelerator=accelerator,
                 model=model,
                 dataloader=valid_loader,
-                item_latent_table=item_latent_table,
                 normalize_target_latent=normalize_target_latent,
                 diffusion_loss_weight=diffusion_loss_weight,
                 ranking_loss_weight=ranking_loss_weight,
@@ -1554,6 +1611,7 @@ def main() -> None:
                 text_history_auxiliary_loss_weight=current_text_history_auxiliary_loss_weight,
                 image_history_auxiliary_loss_weight=current_image_history_auxiliary_loss_weight,
                 auxiliary_ranking_temperature=auxiliary_ranking_temperature,
+                item_lookup_regularization_weight=float(lookup_cfg["regularization_weight"]),
                 desc=f"EvalEpoch@{completed_epoch}",
             )
             if retrieval_validation_enabled:
@@ -1561,7 +1619,6 @@ def main() -> None:
                     accelerator=accelerator,
                     model=model,
                     dataloader=valid_loader,
-                    item_latent_table=item_latent_table,
                     normalize_target_latent=normalize_target_latent,
                     num_inference_steps=retrieval_validation_num_inference_steps,
                     topk_list=retrieval_validation_topk,
@@ -1642,7 +1699,6 @@ def main() -> None:
             accelerator=accelerator,
             model=model,
             dataloader=valid_loader,
-            item_latent_table=item_latent_table,
             normalize_target_latent=normalize_target_latent,
             diffusion_loss_weight=diffusion_loss_weight,
             ranking_loss_weight=ranking_loss_weight,
@@ -1652,6 +1708,7 @@ def main() -> None:
             text_history_auxiliary_loss_weight=final_text_history_auxiliary_loss_weight,
             image_history_auxiliary_loss_weight=final_image_history_auxiliary_loss_weight,
             auxiliary_ranking_temperature=auxiliary_ranking_temperature,
+            item_lookup_regularization_weight=float(lookup_cfg["regularization_weight"]),
             desc="Final Eval",
         )
         if retrieval_validation_enabled:
@@ -1659,7 +1716,6 @@ def main() -> None:
                 accelerator=accelerator,
                 model=model,
                 dataloader=valid_loader,
-                item_latent_table=item_latent_table,
                 normalize_target_latent=normalize_target_latent,
                 num_inference_steps=retrieval_validation_num_inference_steps,
                 topk_list=retrieval_validation_topk,

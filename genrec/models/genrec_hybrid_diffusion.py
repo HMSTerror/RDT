@@ -90,6 +90,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
         cf_history_token_keep_rate: float = 1.0,
         popularity_history_token_keep_rate: float = 1.0,
         keep_pooled_condition_tokens: bool = True,
+        item_lookup_table: torch.Tensor | None = None,
+        item_lookup_mode: str = "fixed",
+        item_lookup_residual_scale: float = 1.0,
+        item_lookup_delta_init_std: float = 0.0,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -112,6 +116,15 @@ class GenRecHybridDiffusionRunner(nn.Module):
             raise ValueError(
                 f"latent_dim={self.latent_dim} must be divisible by code_len={self.code_len}."
             )
+        normalized_lookup_mode = str(item_lookup_mode).strip().lower()
+        if normalized_lookup_mode not in {"fixed", "residual", "trainable"}:
+            raise ValueError(
+                f"Unsupported item_lookup_mode={item_lookup_mode!r}. "
+                "Expected one of: fixed, residual, trainable."
+            )
+        self.item_lookup_mode = normalized_lookup_mode
+        self.item_lookup_residual_scale = float(item_lookup_residual_scale)
+        self.item_lookup_delta_init_std = float(item_lookup_delta_init_std)
         self.latent_slot_dim = self.latent_dim // self.code_len
         self.layer_schedule = BranchLayerSchedule(
             text=self._resolve_injection_schedule(text_injection_mode),
@@ -135,6 +148,35 @@ class GenRecHybridDiffusionRunner(nn.Module):
             ),
         }
         self.keep_pooled_condition_tokens = bool(keep_pooled_condition_tokens)
+
+        if item_lookup_table is None:
+            self.register_buffer("item_lookup_base", torch.empty(0, self.latent_dim), persistent=True)
+            self.item_lookup_delta = None
+            self.item_lookup_weight = None
+        else:
+            lookup_table = item_lookup_table.to(dtype=torch.float32).clone()
+            if lookup_table.ndim != 2:
+                raise ValueError(
+                    f"item_lookup_table must be 2D, got shape {tuple(lookup_table.shape)}."
+                )
+            if lookup_table.shape[1] != self.latent_dim:
+                raise ValueError(
+                    "item_lookup_table latent dimension mismatch: "
+                    f"{lookup_table.shape[1]} vs expected {self.latent_dim}."
+                )
+            self.register_buffer("item_lookup_base", lookup_table, persistent=True)
+            if self.item_lookup_mode == "residual":
+                delta = torch.zeros_like(lookup_table)
+                if self.item_lookup_delta_init_std > 0:
+                    delta = torch.randn_like(lookup_table) * self.item_lookup_delta_init_std
+                self.item_lookup_delta = nn.Parameter(delta)
+                self.item_lookup_weight = None
+            elif self.item_lookup_mode == "trainable":
+                self.item_lookup_weight = nn.Parameter(lookup_table.clone())
+                self.item_lookup_delta = None
+            else:
+                self.item_lookup_delta = None
+                self.item_lookup_weight = None
 
         self.token_embed = nn.Embedding(
             self.vocab_size,
@@ -324,6 +366,44 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
+    def get_item_lookup_table(
+        self,
+        *,
+        normalize: bool = False,
+    ) -> torch.Tensor:
+        if self.item_lookup_base.numel() == 0:
+            raise RuntimeError("item lookup table is not initialized for this model.")
+
+        if self.item_lookup_mode == "fixed":
+            table = self.item_lookup_base
+        elif self.item_lookup_mode == "residual":
+            if self.item_lookup_delta is None:
+                raise RuntimeError("item_lookup_delta is not initialized for residual lookup mode.")
+            table = self.item_lookup_base + (self.item_lookup_residual_scale * self.item_lookup_delta)
+        elif self.item_lookup_mode == "trainable":
+            if self.item_lookup_weight is None:
+                raise RuntimeError("item_lookup_weight is not initialized for trainable lookup mode.")
+            table = self.item_lookup_weight
+        else:
+            raise RuntimeError(f"Unknown item_lookup_mode={self.item_lookup_mode!r}.")
+
+        if normalize:
+            return F.normalize(table.float(), dim=-1).to(dtype=table.dtype)
+        return table
+
+    def get_item_lookup_regularization(self) -> torch.Tensor:
+        if self.item_lookup_base.numel() == 0:
+            return self.target_latent_out.weight.new_zeros(())
+        if self.item_lookup_mode == "residual":
+            if self.item_lookup_delta is None:
+                return self.target_latent_out.weight.new_zeros(())
+            return self.item_lookup_delta.float().pow(2).mean()
+        if self.item_lookup_mode == "trainable":
+            if self.item_lookup_weight is None:
+                return self.target_latent_out.weight.new_zeros(())
+            return (self.item_lookup_weight.float() - self.item_lookup_base.float()).pow(2).mean()
+        return self.target_latent_out.weight.new_zeros(())
+
     @classmethod
     def from_batch_metadata(
         cls,
@@ -367,6 +447,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
         cf_history_token_keep_rate: float = 1.0,
         popularity_history_token_keep_rate: float = 1.0,
         keep_pooled_condition_tokens: bool = True,
+        item_lookup_table: torch.Tensor | None = None,
+        item_lookup_mode: str = "fixed",
+        item_lookup_residual_scale: float = 1.0,
+        item_lookup_delta_init_std: float = 0.0,
         dropout: float = 0.0,
     ) -> "GenRecHybridDiffusionRunner":
         special_tokens = manifest.get("special_tokens", {})
@@ -419,6 +503,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
             cf_history_token_keep_rate=cf_history_token_keep_rate,
             popularity_history_token_keep_rate=popularity_history_token_keep_rate,
             keep_pooled_condition_tokens=keep_pooled_condition_tokens,
+            item_lookup_table=item_lookup_table,
+            item_lookup_mode=item_lookup_mode,
+            item_lookup_residual_scale=item_lookup_residual_scale,
+            item_lookup_delta_init_std=item_lookup_delta_init_std,
             dropout=dropout,
         )
 
@@ -888,6 +976,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
         target_item_ids: torch.Tensor | None = None,
         item_embedding_table: torch.Tensor | None = None,
         ranking_sample_weights: torch.Tensor | None = None,
+        item_lookup_regularization_weight: float = 0.0,
     ) -> dict[str, torch.Tensor]:
         diffusion_target = noise if self.prediction_type == "epsilon" else target_latents
         diffusion_loss = F.mse_loss(output.prediction.float(), diffusion_target.float())
@@ -991,6 +1080,7 @@ class GenRecHybridDiffusionRunner(nn.Module):
 
         image_auxiliary_loss = None
         image_history_auxiliary_loss = None
+        item_lookup_regularization_loss = None
         if (
             float(image_auxiliary_loss_weight) > 0
             and output.image_aux_query is not None
@@ -1050,6 +1140,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 image_history_auxiliary_loss = image_history_per_sample_loss.mean()
             total_loss = total_loss + image_history_auxiliary_loss * float(image_history_auxiliary_loss_weight)
 
+        if float(item_lookup_regularization_weight) > 0:
+            item_lookup_regularization_loss = self.get_item_lookup_regularization()
+            total_loss = total_loss + item_lookup_regularization_loss * float(item_lookup_regularization_weight)
+
         payload = {
             "loss": total_loss,
             "diffusion_loss": diffusion_loss,
@@ -1064,6 +1158,8 @@ class GenRecHybridDiffusionRunner(nn.Module):
             payload["image_auxiliary_loss"] = image_auxiliary_loss
         if image_history_auxiliary_loss is not None:
             payload["image_history_auxiliary_loss"] = image_history_auxiliary_loss
+        if item_lookup_regularization_loss is not None:
+            payload["item_lookup_regularization_loss"] = item_lookup_regularization_loss
         return payload
 
     def prepare_training_inputs(
