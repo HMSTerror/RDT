@@ -90,6 +90,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
         cf_history_token_keep_rate: float = 1.0,
         popularity_history_token_keep_rate: float = 1.0,
         keep_pooled_condition_tokens: bool = True,
+        use_text_conditional_layer_norm: bool = False,
+        use_image_conditional_layer_norm: bool = False,
+        use_cf_conditional_layer_norm: bool = False,
+        use_popularity_conditional_layer_norm: bool = False,
         item_lookup_table: torch.Tensor | None = None,
         item_lookup_mode: str = "fixed",
         item_lookup_residual_scale: float = 1.0,
@@ -148,6 +152,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
             ),
         }
         self.keep_pooled_condition_tokens = bool(keep_pooled_condition_tokens)
+        self.use_text_conditional_layer_norm = bool(use_text_conditional_layer_norm)
+        self.use_image_conditional_layer_norm = bool(use_image_conditional_layer_norm)
+        self.use_cf_conditional_layer_norm = bool(use_cf_conditional_layer_norm)
+        self.use_popularity_conditional_layer_norm = bool(use_popularity_conditional_layer_norm)
 
         if item_lookup_table is None:
             self.register_buffer("item_lookup_base", torch.empty(0, self.latent_dim), persistent=True)
@@ -196,7 +204,18 @@ class GenRecHybridDiffusionRunner(nn.Module):
         self.timestep_proj = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.blocks = nn.ModuleList(
-            [GenRecDiTBlock(self.hidden_size, self.num_heads, dropout=dropout) for _ in range(self.depth)]
+            [
+                GenRecDiTBlock(
+                    self.hidden_size,
+                    self.num_heads,
+                    dropout=dropout,
+                    use_text_conditional_layer_norm=self.use_text_conditional_layer_norm,
+                    use_image_conditional_layer_norm=self.use_image_conditional_layer_norm,
+                    use_cf_conditional_layer_norm=self.use_cf_conditional_layer_norm,
+                    use_popularity_conditional_layer_norm=self.use_popularity_conditional_layer_norm,
+                )
+                for _ in range(self.depth)
+            ]
         )
         self.final_norm = RmsNorm(self.hidden_size, eps=1e-6)
         self.text_aux_head = None
@@ -447,6 +466,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
         cf_history_token_keep_rate: float = 1.0,
         popularity_history_token_keep_rate: float = 1.0,
         keep_pooled_condition_tokens: bool = True,
+        use_text_conditional_layer_norm: bool = False,
+        use_image_conditional_layer_norm: bool = False,
+        use_cf_conditional_layer_norm: bool = False,
+        use_popularity_conditional_layer_norm: bool = False,
         item_lookup_table: torch.Tensor | None = None,
         item_lookup_mode: str = "fixed",
         item_lookup_residual_scale: float = 1.0,
@@ -503,6 +526,10 @@ class GenRecHybridDiffusionRunner(nn.Module):
             cf_history_token_keep_rate=cf_history_token_keep_rate,
             popularity_history_token_keep_rate=popularity_history_token_keep_rate,
             keep_pooled_condition_tokens=keep_pooled_condition_tokens,
+            use_text_conditional_layer_norm=use_text_conditional_layer_norm,
+            use_image_conditional_layer_norm=use_image_conditional_layer_norm,
+            use_cf_conditional_layer_norm=use_cf_conditional_layer_norm,
+            use_popularity_conditional_layer_norm=use_popularity_conditional_layer_norm,
             item_lookup_table=item_lookup_table,
             item_lookup_mode=item_lookup_mode,
             item_lookup_residual_scale=item_lookup_residual_scale,
@@ -824,6 +851,24 @@ class GenRecHybridDiffusionRunner(nn.Module):
 
         return pooled_query, history_query
 
+    def _summarize_branch_condition(
+        self,
+        branch_output: ConditionProjectorOutput,
+    ) -> torch.Tensor | None:
+        if branch_output.tokens is None or branch_output.attention_mask is None:
+            return None
+        tokens = branch_output.tokens
+        attention_mask = branch_output.attention_mask.to(device=tokens.device, dtype=torch.bool)
+        if tokens.ndim != 3 or attention_mask.ndim != 2:
+            raise ValueError("Branch tokens and attention mask must have shapes [B, L, H] and [B, L].")
+        weights = attention_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        summary = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        empty_rows = ~attention_mask.any(dim=1)
+        if empty_rows.any():
+            summary = summary.clone()
+            summary[empty_rows] = 0
+        return summary
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -912,21 +957,50 @@ class GenRecHybridDiffusionRunner(nn.Module):
                 ),
             )
 
+        text_cond_summary = (
+            self._summarize_branch_condition(text_branch)
+            if self.use_text_conditional_layer_norm
+            else None
+        )
+        image_cond_summary = (
+            self._summarize_branch_condition(image_branch)
+            if self.use_image_conditional_layer_norm
+            else None
+        )
+        cf_cond_summary = (
+            self._summarize_branch_condition(cf_branch)
+            if self.use_cf_conditional_layer_norm
+            else None
+        )
+        popularity_cond_summary = (
+            self._summarize_branch_condition(popularity_branch)
+            if self.use_popularity_conditional_layer_norm
+            else None
+        )
+
         for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
                 attention_mask=attention_mask,
                 text_tokens=text_branch.tokens if self.layer_schedule.text[layer_idx] else None,
                 text_mask=text_branch.attention_mask if self.layer_schedule.text[layer_idx] else None,
+                text_cond=text_cond_summary if self.layer_schedule.text[layer_idx] else None,
                 image_tokens=image_branch.tokens if self.layer_schedule.image[layer_idx] else None,
                 image_mask=image_branch.attention_mask if self.layer_schedule.image[layer_idx] else None,
+                image_cond=image_cond_summary if self.layer_schedule.image[layer_idx] else None,
                 cf_tokens=cf_branch.tokens if self.layer_schedule.cf[layer_idx] else None,
                 cf_mask=cf_branch.attention_mask if self.layer_schedule.cf[layer_idx] else None,
+                cf_cond=cf_cond_summary if self.layer_schedule.cf[layer_idx] else None,
                 popularity_tokens=(
                     popularity_branch.tokens if self.layer_schedule.popularity[layer_idx] else None
                 ),
                 popularity_mask=(
                     popularity_branch.attention_mask
+                    if self.layer_schedule.popularity[layer_idx]
+                    else None
+                ),
+                popularity_cond=(
+                    popularity_cond_summary
                     if self.layer_schedule.popularity[layer_idx]
                     else None
                 ),

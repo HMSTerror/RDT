@@ -61,6 +61,9 @@ conditioning:
   use_cf_history: true
   use_cf_pooled: true
   use_target_cf: false
+  conditional_layer_norm:
+    enabled: false
+    modalities: [text, image]
 
 diffusion:
   prediction_type: epsilon

@@ -13,6 +13,29 @@ from models.rdt.blocks import CrossAttention
 from .condition_projector import ConditionBranchProjector
 
 
+class ConditionalLayerNorm(nn.Module):
+    """Zero-initialized conditional normalization used to modulate query states."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.norm = RmsNorm(hidden_size, eps=eps)
+        self.modulation = nn.Linear(hidden_size, hidden_size * 2)
+        nn.init.zeros_(self.modulation.weight)
+        nn.init.zeros_(self.modulation.bias)
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor | None) -> torch.Tensor:
+        x = self.norm(x)
+        if condition is None:
+            return x
+        if condition.ndim != 2 or condition.shape[0] != x.shape[0] or condition.shape[1] != x.shape[2]:
+            raise ValueError(
+                "ConditionalLayerNorm expected condition with shape "
+                f"({x.shape[0]}, {x.shape[2]}), got {tuple(condition.shape)}."
+            )
+        scale, shift = self.modulation(condition.to(dtype=x.dtype)).chunk(2, dim=-1)
+        return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
 class MaskedSelfAttention(nn.Module):
     """Multi-head self-attention with an optional padding mask."""
 
@@ -97,7 +120,17 @@ class MaskedSelfAttention(nn.Module):
 class GenRecDiTBlock(nn.Module):
     """DiT-style block for semantic-token recommendation with RDT-style multimodal injection."""
 
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        *,
+        use_text_conditional_layer_norm: bool = False,
+        use_image_conditional_layer_norm: bool = False,
+        use_cf_conditional_layer_norm: bool = False,
+        use_popularity_conditional_layer_norm: bool = False,
+    ) -> None:
         super().__init__()
         self.norm1 = RmsNorm(hidden_size, eps=1e-6)
         self.self_attn = MaskedSelfAttention(
@@ -109,7 +142,10 @@ class GenRecDiTBlock(nn.Module):
             proj_drop=dropout,
             norm_layer=RmsNorm,
         )
-        self.norm2 = RmsNorm(hidden_size, eps=1e-6)
+        self.text_norm = RmsNorm(hidden_size, eps=1e-6)
+        self.text_cond_norm = (
+            ConditionalLayerNorm(hidden_size, eps=1e-6) if use_text_conditional_layer_norm else None
+        )
         self.text_cross_attn = CrossAttention(
             hidden_size,
             num_heads=num_heads,
@@ -119,7 +155,10 @@ class GenRecDiTBlock(nn.Module):
             proj_drop=dropout,
             norm_layer=RmsNorm,
         )
-        self.norm3 = RmsNorm(hidden_size, eps=1e-6)
+        self.image_norm = RmsNorm(hidden_size, eps=1e-6)
+        self.image_cond_norm = (
+            ConditionalLayerNorm(hidden_size, eps=1e-6) if use_image_conditional_layer_norm else None
+        )
         self.image_cross_attn = CrossAttention(
             hidden_size,
             num_heads=num_heads,
@@ -129,7 +168,10 @@ class GenRecDiTBlock(nn.Module):
             proj_drop=dropout,
             norm_layer=RmsNorm,
         )
-        self.norm4 = RmsNorm(hidden_size, eps=1e-6)
+        self.cf_norm = RmsNorm(hidden_size, eps=1e-6)
+        self.cf_cond_norm = (
+            ConditionalLayerNorm(hidden_size, eps=1e-6) if use_cf_conditional_layer_norm else None
+        )
         self.cf_cross_attn = CrossAttention(
             hidden_size,
             num_heads=num_heads,
@@ -139,7 +181,12 @@ class GenRecDiTBlock(nn.Module):
             proj_drop=dropout,
             norm_layer=RmsNorm,
         )
-        self.norm5 = RmsNorm(hidden_size, eps=1e-6)
+        self.popularity_norm = RmsNorm(hidden_size, eps=1e-6)
+        self.popularity_cond_norm = (
+            ConditionalLayerNorm(hidden_size, eps=1e-6)
+            if use_popularity_conditional_layer_norm
+            else None
+        )
         self.popularity_cross_attn = CrossAttention(
             hidden_size,
             num_heads=num_heads,
@@ -167,16 +214,32 @@ class GenRecDiTBlock(nn.Module):
         text_mask: torch.Tensor | None = None,
         image_tokens: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        text_cond: torch.Tensor | None = None,
+        image_cond: torch.Tensor | None = None,
         cf_tokens: torch.Tensor | None = None,
         cf_mask: torch.Tensor | None = None,
+        cf_cond: torch.Tensor | None = None,
         popularity_tokens: torch.Tensor | None = None,
         popularity_mask: torch.Tensor | None = None,
+        popularity_cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attn(self.norm1(x), attention_mask=attention_mask)
-        x = x + self.text_cross_attn(self.norm2(x), text_tokens, text_mask)
-        x = x + self.image_cross_attn(self.norm3(x), image_tokens, image_mask)
-        x = x + self.cf_cross_attn(self.norm4(x), cf_tokens, cf_mask)
-        x = x + self.popularity_cross_attn(self.norm5(x), popularity_tokens, popularity_mask)
+        text_query = (
+            self.text_cond_norm(x, text_cond) if self.text_cond_norm is not None else self.text_norm(x)
+        )
+        x = x + self.text_cross_attn(text_query, text_tokens, text_mask)
+        image_query = (
+            self.image_cond_norm(x, image_cond) if self.image_cond_norm is not None else self.image_norm(x)
+        )
+        x = x + self.image_cross_attn(image_query, image_tokens, image_mask)
+        cf_query = self.cf_cond_norm(x, cf_cond) if self.cf_cond_norm is not None else self.cf_norm(x)
+        x = x + self.cf_cross_attn(cf_query, cf_tokens, cf_mask)
+        popularity_query = (
+            self.popularity_cond_norm(x, popularity_cond)
+            if self.popularity_cond_norm is not None
+            else self.popularity_norm(x)
+        )
+        x = x + self.popularity_cross_attn(popularity_query, popularity_tokens, popularity_mask)
         x = x + self.ffn(self.norm6(x))
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1).to(dtype=x.dtype)

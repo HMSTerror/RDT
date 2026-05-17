@@ -1,17 +1,17 @@
-experiment_name: genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v16_cf_only_all_beauty_lookup_residual_histaux
+experiment_name: genrec_hybrid_diffusion_amazon_stage2_fullmodal_30ep_v16_cf_only_beauty2014_lookup_residual_histaux
 
 data:
-  dataset_name: amazon_reviews23_all_beauty
-  split_root: buffer/amazon_reviews23_all_beauty_real
-  tokenized_root: data/Amazon_Reviews_2023_All_Beauty/tokenized_semantic_ids_cf_only
-  semantic_id_root: data/Amazon_Reviews_2023_All_Beauty/semantic_ids_pq_cf_only
+  dataset_name: amazon_beauty_2014
+  split_root: buffer/amazon_beauty_2014_real
+  tokenized_root: data/Amazon_Beauty_2014/tokenized_semantic_ids_cf_only
+  semantic_id_root: data/Amazon_Beauty_2014/semantic_ids_pq_cf_only
   train_split: train
   valid_split: val
   test_split: test
   history_len: 50
 
 representation:
-  target_latent_path: data/Amazon_Reviews_2023_All_Beauty/item_embeddings_cf.npy
+  target_latent_path: data/Amazon_Beauty_2014/item_embeddings_cf.npy
   latent_dim: 128
   normalize_target_latent: true
   lookup:
@@ -45,9 +45,9 @@ conditioning:
   use_image: true
   use_cf: false
   use_popularity: false
-  text_embedding_path: data/Amazon_Reviews_2023_All_Beauty/item_embeddings_text_to_cf.npy
-  image_embedding_path: data/Amazon_Reviews_2023_All_Beauty/item_embeddings_image_to_cf.npy
-  cf_embedding_path: data/Amazon_Reviews_2023_All_Beauty/item_embeddings_cf.npy
+  text_embedding_path: data/Amazon_Beauty_2014/item_embeddings_text_to_cf.npy
+  image_embedding_path: data/Amazon_Beauty_2014/item_embeddings_image_to_cf.npy
+  cf_embedding_path: data/Amazon_Beauty_2014/item_embeddings_cf.npy
   popularity_num_buckets: 16
   popularity_cond_dim: 32
   use_text_history: true

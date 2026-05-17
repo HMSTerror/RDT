@@ -27,10 +27,9 @@ item store at training time. This keeps the preprocessing output practical in
 both disk usage and I/O.
 
 Important implementation note:
-To keep the chunk layout compatible with fixed-size dirty_bit buffers, this
-script drops the final incomplete chunk by default. This avoids generating a
-dirty_bit file of length CHUNK_SIZE for a chunk that contains fewer than
-CHUNK_SIZE actual samples.
+By default this script preserves the final incomplete chunk instead of
+dropping it. This keeps every valid sample for evaluation and baseline
+comparison. Use `--drop-last-incomplete-chunk` to restore the older behavior.
 """
 
 from __future__ import annotations
@@ -154,12 +153,17 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=int,
         default=0,
-        help="Optional cap on the number of written samples. Rounded down to a multiple of chunk_size.",
+        help="Optional cap on the number of written samples.",
     )
     parser.add_argument(
         "--stats-only",
         action="store_true",
         help="Only compute dataset statistics and storage estimates, without writing chunks.",
+    )
+    parser.add_argument(
+        "--drop-last-incomplete-chunk",
+        action="store_true",
+        help="Drop the final partially filled chunk in each split to match the legacy behavior.",
     )
     parser.add_argument(
         "--seed",
@@ -594,8 +598,8 @@ def safe_write_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
         lock.release_lock()
 
 
-def write_dirty_bit(chunk_dir: Path, chunk_size: int) -> None:
-    dirty_bit = np.zeros(chunk_size, dtype=np.uint8)
+def write_dirty_bit(chunk_dir: Path, num_samples: int) -> None:
+    dirty_bit = np.zeros(num_samples, dtype=np.uint8)
     path = chunk_dir / "dirty_bit"
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(str(path))
@@ -722,17 +726,31 @@ def build_split_write_plan(
     *,
     chunk_size: int,
     max_samples: int,
+    drop_last_incomplete_chunk: bool,
 ) -> Dict[str, int]:
     samples_to_write = raw_count
     if max_samples > 0:
         samples_to_write = min(samples_to_write, max_samples)
-    full_chunks = samples_to_write // chunk_size
-    samples_to_write = full_chunks * chunk_size
-    dropped_tail = raw_count - samples_to_write
+    dropped_tail = 0
+    if drop_last_incomplete_chunk:
+        full_chunks = samples_to_write // chunk_size
+        samples_to_write = full_chunks * chunk_size
+        dropped_tail = raw_count - samples_to_write
+        num_chunks = full_chunks
+        last_chunk_size = chunk_size if num_chunks > 0 else 0
+    else:
+        dropped_tail = raw_count - samples_to_write
+        num_chunks = int(math.ceil(samples_to_write / chunk_size)) if samples_to_write > 0 else 0
+        if samples_to_write == 0:
+            last_chunk_size = 0
+        else:
+            remainder = samples_to_write % chunk_size
+            last_chunk_size = remainder if remainder > 0 else chunk_size
     return {
         "raw_count": raw_count,
         "samples_to_write": samples_to_write,
-        "full_chunks": full_chunks,
+        "num_chunks": num_chunks,
+        "last_chunk_size": last_chunk_size,
         "dropped_tail": dropped_tail,
     }
 
@@ -771,6 +789,7 @@ def build_stats_payload(
         "storage_mode": "lightweight_chunk_index",
         "prefetch_images": bool(args.prefetch_images),
         "split_mode": args.split_mode,
+        "drop_last_incomplete_chunk": bool(args.drop_last_incomplete_chunk),
     }
     if split_name is not None:
         payload["split_name"] = split_name
@@ -780,13 +799,11 @@ def build_stats_payload(
 def flush_chunk_samples(
     chunk_dir: Path,
     chunk_samples: List[Dict[str, np.ndarray]],
-    chunk_size: int,
     history_len: int,
 ) -> None:
-    if len(chunk_samples) != chunk_size:
-        raise ValueError(
-            f"Expected exactly {chunk_size} samples in a full chunk, got {len(chunk_samples)}."
-        )
+    if not chunk_samples:
+        raise ValueError("Cannot flush an empty chunk.")
+    chunk_size = len(chunk_samples)
 
     payload = {
         "user_ids": np.zeros((chunk_size,), dtype=np.int32),
@@ -825,6 +842,7 @@ def main() -> None:
     print(f"history_len  : {args.history_len}")
     print(f"chunk_size   : {args.chunk_size}")
     print(f"item_universe: {args.item_universe_split}")
+    print(f"drop_last    : {args.drop_last_incomplete_chunk}")
 
     interactions = load_review_interactions(args.reviews_path)
     if not interactions:
@@ -872,6 +890,7 @@ def main() -> None:
             split_raw_counts[split_name],
             chunk_size=args.chunk_size,
             max_samples=args.max_samples,
+            drop_last_incomplete_chunk=bool(args.drop_last_incomplete_chunk),
         )
         for split_name in split_names
     }
@@ -882,8 +901,7 @@ def main() -> None:
 
     if total_samples_to_write == 0:
         raise RuntimeError(
-            "Not enough samples to form a full chunk under the current split settings. "
-            f"Need at least {args.chunk_size} samples in at least one split."
+            "No samples remain to write under the current split settings."
         )
 
     light_sample_bytes = estimate_light_sample_bytes(args.history_len)
@@ -899,7 +917,8 @@ def main() -> None:
             f"[split:{split_name}] total={plan['raw_count']} "
             f"write={plan['samples_to_write']} "
             f"drop_tail={plan['dropped_tail']} "
-            f"chunks={plan['full_chunks']} "
+            f"chunks={plan['num_chunks']} "
+            f"last_chunk={plan['last_chunk_size']} "
             f"dropped_unknown_targets={dropped_unknown_targets}"
         )
     print(f"[disk]    approx lightweight index payload={approx_gib:.4f} GiB")
@@ -912,7 +931,7 @@ def main() -> None:
             sequences=sequences,
             samples_to_write=split_write_plans["train"]["samples_to_write"],
             dropped_tail=split_write_plans["train"]["dropped_tail"],
-            num_chunks_written=split_write_plans["train"]["full_chunks"],
+            num_chunks_written=split_write_plans["train"]["num_chunks"],
             total_samples_before_chunk_drop=split_write_plans["train"]["raw_count"],
             split_name="train",
         )
@@ -926,6 +945,7 @@ def main() -> None:
             "split_mode": args.split_mode,
             "history_len": args.history_len,
             "chunk_size": args.chunk_size,
+            "drop_last_incomplete_chunk": bool(args.drop_last_incomplete_chunk),
             "k_core": K_CORE,
             "num_users": len(user_map),
             "num_items": len(item_map),
@@ -941,7 +961,8 @@ def main() -> None:
                     "total_samples_before_chunk_drop": split_write_plans[split_name]["raw_count"],
                     "total_samples_written": split_write_plans[split_name]["samples_to_write"],
                     "dropped_tail_samples": split_write_plans[split_name]["dropped_tail"],
-                    "num_chunks_written": split_write_plans[split_name]["full_chunks"],
+                    "num_chunks_written": split_write_plans[split_name]["num_chunks"],
+                    "last_chunk_size": split_write_plans[split_name]["last_chunk_size"],
                 }
                 for split_name in split_names
             },
@@ -1017,7 +1038,6 @@ def main() -> None:
                 flush_chunk_samples(
                     chunk_dir=chunk_dir,
                     chunk_samples=current_chunk_samples[split_name],
-                    chunk_size=args.chunk_size,
                     history_len=args.history_len,
                 )
                 current_chunk_samples[split_name] = []
@@ -1036,10 +1056,14 @@ def main() -> None:
 
     for split_name in split_names:
         if current_chunk_samples[split_name]:
-            raise RuntimeError(
-                "Encountered a partially filled chunk at the end of writing. "
-                f"This should not happen after dropping tail samples for split `{split_name}`."
+            chunk_dir = split_roots[split_name] / f"chunk_{chunk_idx_by_split[split_name]}"
+            chunk_dir.mkdir(parents=True, exist_ok=False)
+            flush_chunk_samples(
+                chunk_dir=chunk_dir,
+                chunk_samples=current_chunk_samples[split_name],
+                history_len=args.history_len,
             )
+            chunk_idx_by_split[split_name] += 1
 
         split_stats = build_stats_payload(
             args=args,

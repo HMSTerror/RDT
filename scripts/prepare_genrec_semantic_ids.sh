@@ -16,10 +16,11 @@ cd "${ROOT_DIR}"
 : "${TOKENIZED_ROOT:=data/Amazon_Music_And_Instruments/tokenized_semantic_ids}"
 : "${ITEM_MAP_PATH:=${BUFFER_ROOT}/train/item_map.json}"
 : "${QUANT_METHOD:=pq}"
-: "${ITEM_UNIVERSE_SPLIT:=train}"
+: "${ITEM_UNIVERSE_SPLIT:=all}"
 : "${CF_FIT_SPLIT:=train}"
 : "${CF_SPLIT_MODE:=leave_last_two}"
 : "${SEMANTIC_ID_FIT_SPLIT:=train}"
+: "${DROP_LAST_INCOMPLETE_CHUNK:=0}"
 : "${PRIMARY_EMBED_SOURCE:=auto}"
 
 echo "========== [1/7] text embeddings =========="
@@ -78,6 +79,7 @@ IMAGE_ROOT="${IMAGE_ROOT}" \
 OUTPUT_ROOT="${BUFFER_ROOT}" \
 SPLIT_MODE=leave_last_two \
 ITEM_UNIVERSE_SPLIT="${ITEM_UNIVERSE_SPLIT}" \
+DROP_LAST_INCOMPLETE_CHUNK="${DROP_LAST_INCOMPLETE_CHUNK}" \
 bash scripts/preprocess_amazon_minimal.sh
 
 if [[ "${ENABLE_FUSION:-0}" == "1" ]]; then
